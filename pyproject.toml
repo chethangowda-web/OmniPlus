@@ -21,6 +21,8 @@ dependencies = [
     "aiofiles>=23.2.0",
     "PyGithub>=2.1.0",
     "duckduckgo-search>=6.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
 ]
 
 [project.scripts]

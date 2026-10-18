@@ -237,5 +237,19 @@ def show_config() -> None:
     console.print(table)
 
 
+# ---------------------------------------------------------------------------
+# serve command (Localhost Web UI)
+# ---------------------------------------------------------------------------
+
+@main.command("serve")
+@click.option("--host", default="127.0.0.1", help="Host to bind the web server to.")
+@click.option("--port", default=8000, help="Port to bind the web server to.")
+def serve(host: str, port: int) -> None:
+    """Launch the OmniPlus localhost Web UI in your browser."""
+    from mcp_assistant.web.app import run_server
+    console.print(f"\n[bold green]🚀 OmniPlus Web UI starting at:[/bold green] [bold cyan]http://{host}:{port}[/bold cyan]\n")
+    run_server(host=host, port=port)
+
+
 if __name__ == "__main__":
     main()
