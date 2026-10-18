@@ -5,6 +5,7 @@ Commands
 mcp-assistant chat   - Start an interactive REPL session.
 mcp-assistant run    - Run a single query non-interactively.
 mcp-assistant tools  - List all available MCP tools.
+mcp-assistant config - Show current configuration.
 """
 from __future__ import annotations
 
@@ -13,12 +14,15 @@ import sys
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table
 
 from mcp_assistant.ui.display import (
     print_error,
     print_response,
     print_thinking,
+    print_tool_call,
     print_tool_list,
     print_welcome_banner,
 )
@@ -75,7 +79,7 @@ def chat() -> None:
             tool_count = len(assistant.get_tool_names())
             console.print(
                 f"[dim]Loaded [bold cyan]{tool_count}[/bold cyan] MCP tools. "
-                f"Type [bold red]exit[/bold red] to quit.[/dim]\n"
+                f"Type [bold red]/exit[/bold red] or [bold red]exit[/bold red] to quit.[/dim]\n"
             )
         except EnvironmentError as exc:
             print_error(str(exc))
@@ -96,6 +100,29 @@ def chat() -> None:
                 if user_input.lower() in {"exit", "quit", "bye", ":q"}:
                     break
 
+                # Handle slash commands
+                if user_input.startswith("/"):
+                    cmd = user_input.lower().strip()
+                    if cmd in {"/exit", "/quit"}:
+                        break
+                    elif cmd == "/help":
+                        console.print(Panel(
+                            "[bold]Commands:[/bold]\n"
+                            " [cyan]/help[/cyan]  — show this help\n"
+                            " [cyan]/tools[/cyan] — list available tools\n"
+                            " [cyan]/clear[/cyan] — clear conversation history\n"
+                            " [cyan]/exit[/cyan]  — quit",
+                            title="Help"
+                        ))
+                    elif cmd == "/tools":
+                        print_tool_list(assistant.get_tool_names())
+                    elif cmd == "/clear":
+                        assistant.clear_history()
+                        console.print("[green]Conversation history cleared.[/green]")
+                    else:
+                        console.print(f"[yellow]Unknown command: {user_input}[/yellow]")
+                    continue
+
                 try:
                     with print_thinking("Thinking…"):
                         response = await assistant.chat(user_input)
@@ -103,6 +130,7 @@ def chat() -> None:
                 except Exception as exc:  # noqa: BLE001
                     print_error(f"Error during chat: {exc}")
         finally:
+            assistant.save_history()
             await assistant.close()
             console.print("\n[bold blue]Goodbye! 👋[/bold blue]\n")
 
@@ -178,6 +206,35 @@ def tools() -> None:
         _run_async(_list_tools())
     except KeyboardInterrupt:
         pass
+
+
+# ---------------------------------------------------------------------------
+# config command
+# ---------------------------------------------------------------------------
+
+@main.command("config")
+def show_config() -> None:
+    """Display current configuration and enabled integrations."""
+    from mcp_assistant.config import get_settings
+    from mcp_assistant.servers.config_builder import build_mcp_config
+    try:
+        settings = get_settings()
+    except EnvironmentError as e:
+        print_error(str(e))
+        return
+    config = build_mcp_config(settings)
+    table = Table(title="MCP Assistant Configuration")
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value")
+    table.add_row("Model", settings.gemini_model)
+    table.add_row(
+        "API Key",
+        f"{'*' * 8}...{settings.gemini_api_key[-4:]}"
+        if len(settings.gemini_api_key) > 8 else "****"
+    )
+    table.add_row("Enabled Servers", ", ".join(config.keys()))
+    table.add_row("GitHub", "✅ Enabled" if settings.has_github() else "❌ Not configured")
+    console.print(table)
 
 
 if __name__ == "__main__":

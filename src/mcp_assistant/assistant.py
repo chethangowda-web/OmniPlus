@@ -8,6 +8,8 @@ This module provides the ``MCPAssistant`` class, which:
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -54,16 +56,18 @@ class MCPAssistant:
             model=settings.gemini_model,
             google_api_key=settings.gemini_api_key,
             temperature=0.2,
-            convert_system_message_to_human=True,
         )
         self._tools: list[Any] = []
         self._agent: Any = None
         self._mcp_client: MultiServerMCPClient | None = None
+        self._history: list = []  # conversation history
 
     async def setup(self) -> None:
         """Initialise the MCP client, load tools, and create the ReAct agent.
 
         This must be called before ``chat()`` or ``get_tool_names()``.
+        In langchain-mcp-adapters >= 0.1.0 MultiServerMCPClient is NOT a
+        context manager — just call get_tools() directly.
         """
         mcp_config = build_mcp_config(self._settings)
         self._mcp_client = MultiServerMCPClient(mcp_config)
@@ -90,7 +94,8 @@ class MCPAssistant:
         if self._agent is None:
             raise RuntimeError("MCPAssistant.setup() must be called before chat().")
 
-        result = await self._agent.ainvoke({"messages": [("human", message)]})
+        self._history.append(("human", message))
+        result = await self._agent.ainvoke({"messages": self._history})
 
         # The agent returns a dict with a "messages" list; the last message is
         # the AIMessage containing the final answer.
@@ -99,10 +104,30 @@ class MCPAssistant:
             last = messages[-1]
             # Support both AIMessage objects and plain dicts.
             if hasattr(last, "content"):
-                return str(last.content)
-            if isinstance(last, dict):
-                return str(last.get("content", ""))
+                content = str(last.content)
+            elif isinstance(last, dict):
+                content = str(last.get("content", ""))
+            else:
+                content = "(No response)"
+            self._history.append(("assistant", content))
+            return content
         return "(No response)"
+
+    def clear_history(self) -> None:
+        """Clear the conversation history."""
+        self._history = []
+
+    def save_history(self) -> None:
+        """Save conversation history to ~/.mcp-assistant/history.json."""
+        history_dir = Path.home() / ".mcp-assistant"
+        history_dir.mkdir(exist_ok=True)
+        history_file = history_dir / "history.json"
+        serializable = [
+            {"role": role, "content": content}
+            for role, content in self._history
+        ]
+        with open(history_file, "w") as f:
+            json.dump(serializable, f, indent=2)
 
     def get_tool_names(self) -> list[str]:
         """Return the names of all currently loaded MCP tools.
@@ -113,9 +138,11 @@ class MCPAssistant:
         return [t.name for t in self._tools]
 
     async def close(self) -> None:
-        """Clean up MCP client connections."""
-        if self._mcp_client is not None:
-            try:
-                await self._mcp_client.__aexit__(None, None, None)
-            except Exception:  # noqa: BLE001
-                pass
+        """Clean up MCP client connections.
+
+        Note: In langchain-mcp-adapters >= 0.1.0 the client does not maintain
+        persistent connections, so no explicit cleanup is needed.
+        """
+        # MultiServerMCPClient in v0.1.0+ does not support __aexit__.
+        # Each tool call opens and closes its own session, so nothing to close.
+        pass

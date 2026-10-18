@@ -122,3 +122,12 @@ def print_error(error: str) -> None:
     console.print()
     console.print(panel)
     console.print()
+
+
+def print_tool_call(tool_name: str) -> None:
+    """Print an indicator when a tool is being called.
+
+    Args:
+        tool_name: The name of the MCP tool being invoked.
+    """
+    console.print(f"  [dim]🔧 Using tool: [bold magenta]{tool_name}[/bold magenta][/dim]")

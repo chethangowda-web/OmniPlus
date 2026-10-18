@@ -13,6 +13,7 @@ dependencies = [
     "langchain>=0.3.0",
     "langchain-google-genai>=2.0.0",
     "langchain-mcp-adapters>=0.1.0",
+    "langgraph>=0.2.0",
     "rich>=13.7.0",
     "click>=8.1.0",
     "python-dotenv>=1.0.0",
