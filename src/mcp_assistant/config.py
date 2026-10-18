@@ -20,7 +20,7 @@ class Settings:
     """Application settings loaded from environment variables."""
 
     gemini_api_key: str
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-2.5-flash"
     github_token: str | None = None
     gitlab_token: str | None = None
     gitlab_url: str = "https://gitlab.com"
@@ -57,7 +57,7 @@ def get_settings() -> Settings:
 
     return Settings(
         gemini_api_key=gemini_api_key,
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip(),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
         github_token=os.getenv("GITHUB_TOKEN") or None,
         gitlab_token=os.getenv("GITLAB_TOKEN") or None,
         gitlab_url=os.getenv("GITLAB_URL", "https://gitlab.com").strip(),
