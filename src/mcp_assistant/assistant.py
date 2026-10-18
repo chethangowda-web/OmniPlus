@@ -191,13 +191,81 @@ class MCPAssistant:
         with open(history_file, "w") as f:
             json.dump(serializable, f, indent=2)
 
+    async def stream_chat(self, message: str):
+        """Stream response tokens and tool execution events in real-time."""
+        if self._agent is None:
+            raise RuntimeError("MCPAssistant.setup() must be called before stream_chat().")
+
+        self._history.append(("human", message))
+        full_text: list[str] = []
+
+        try:
+            async for event in self._agent.astream_events({"messages": self._history}, version="v2"):
+                kind = event["event"]
+                if kind == "on_chat_model_stream":
+                    chunk_content = event["data"]["chunk"].content
+                    if chunk_content:
+                        text = ""
+                        if isinstance(chunk_content, str):
+                            text = chunk_content
+                        elif isinstance(chunk_content, list):
+                            for item in chunk_content:
+                                if isinstance(item, dict) and "text" in item:
+                                    text += item["text"]
+                                elif isinstance(item, str):
+                                    text += item
+                                elif hasattr(item, "text"):
+                                    text += str(item.text)
+                        if text:
+                            full_text.append(text)
+                            yield {"type": "token", "text": text}
+                elif kind == "on_tool_start":
+                    yield {
+                        "type": "tool_start",
+                        "tool": event.get("name", "tool"),
+                        "input": str(event.get("data", {}).get("input", ""))[:140]
+                    }
+                elif kind == "on_tool_end":
+                    yield {
+                        "type": "tool_end",
+                        "tool": event.get("name", "tool"),
+                        "output": str(event.get("data", {}).get("output", ""))[:140]
+                    }
+
+            final_response = "".join(full_text)
+            if final_response:
+                self._history.append(("assistant", final_response))
+            yield {"type": "done", "response": final_response}
+
+        except Exception as exc:
+            yield {"type": "error", "message": str(exc)}
+
     def get_tool_names(self) -> list[str]:
         """Return the names of all currently loaded MCP tools.
 
         Returns:
             Sorted list of tool name strings.
         """
-        return [t.name for t in self._tools]
+        return [getattr(t, "name", str(t)) for t in self._tools]
+
+    def get_tool_details(self) -> list[dict[str, Any]]:
+        """Return structured metadata and schema for loaded MCP tools."""
+        details = []
+        for t in self._tools:
+            name = getattr(t, "name", str(t))
+            desc = getattr(t, "description", "") or "Execute tool actions through MCP."
+            schema = ""
+            if hasattr(t, "args_schema") and t.args_schema:
+                try:
+                    schema = str(t.args_schema.schema())
+                except Exception:
+                    schema = str(t.args_schema)
+            details.append({
+                "name": name,
+                "description": desc,
+                "schema": schema,
+            })
+        return details
 
     async def close(self) -> None:
         """Clean up MCP client connections.

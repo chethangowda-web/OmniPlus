@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 
 PYTHON = sys.executable
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 
 def test_websearch_config():

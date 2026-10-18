@@ -1,10 +1,14 @@
-"""FastAPI Web Server for OmniPlus AI Assistant — Next-Gen Dashboard UI."""
+"""FastAPI Web Server for OmniPlus AI Assistant — Full Power Dashboard."""
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from pathlib import Path
 from typing import Any
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -12,7 +16,7 @@ from mcp_assistant.config import get_settings
 from mcp_assistant.assistant import MCPAssistant
 from mcp_assistant.servers.config_builder import build_mcp_config
 
-app = FastAPI(title="OmniPlus AI Assistant", version="0.1.0")
+app = FastAPI(title="OmniPlus AI Assistant", version="0.2.0")
 
 _assistant_instance: MCPAssistant | None = None
 _init_lock = asyncio.Lock()
@@ -47,9 +51,19 @@ class ChatResponse(BaseModel):
     tools: list[str]
 
 
+class SettingsUpdateRequest(BaseModel):
+    model: str | None = None
+    api_key: str | None = None
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "app": "OmniPlus"}
+    return {
+        "status": "ok",
+        "app": "OmniPlus",
+        "version": "0.2.0",
+        "python": os.sys.version.split()[0],
+    }
 
 
 @app.get("/api/config")
@@ -61,9 +75,25 @@ async def get_config_info():
             "model": settings.gemini_model,
             "has_github": settings.has_github(),
             "enabled_servers": list(servers.keys()),
+            "api_key_masked": f"{settings.gemini_api_key[:6]}...{settings.gemini_api_key[-4:]}" if len(settings.gemini_api_key) > 10 else "****",
         }
     except Exception as e:
-        return {"error": str(e), "model": "gemini-2.5-flash", "enabled_servers": ["filesystem", "websearch"]}
+        return {"error": str(e), "model": "gemini-3.5-flash", "enabled_servers": ["filesystem", "websearch"]}
+
+
+@app.post("/api/settings/update")
+async def update_settings(req: SettingsUpdateRequest):
+    global _assistant_instance
+    if req.model:
+        os.environ["GEMINI_MODEL"] = req.model.strip()
+    if req.api_key and req.api_key.strip():
+        os.environ["GEMINI_API_KEY"] = req.api_key.strip()
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    _assistant_instance = MCPAssistant(settings)
+    await _assistant_instance.setup()
+    return {"status": "updated", "model": settings.gemini_model}
 
 
 @app.get("/api/tools")
@@ -77,6 +107,82 @@ async def get_tools():
         return {"tools": [], "error": str(e)}
 
 
+@app.get("/api/tools/detailed")
+async def get_tools_detailed():
+    try:
+        assistant = await get_or_create_assistant()
+        return {"tools": assistant.get_tool_details()}
+    except Exception as e:
+        return {"tools": [], "error": str(e)}
+
+
+@app.get("/api/files/tree")
+async def get_files_tree():
+    """Scan and return the current project directory structure safely."""
+    def build_tree(path: str, max_depth: int = 3, cur_depth: int = 0):
+        if cur_depth > max_depth:
+            return []
+        items = []
+        try:
+            for entry in sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower())):
+                if entry.name in {'.git', '.venv', '__pycache__', 'dist', 'build', '.idea', 'node_modules'}:
+                    continue
+                rel_path = os.path.relpath(entry.path, ".").replace("\\", "/")
+                if entry.is_dir():
+                    items.append({
+                        "name": entry.name,
+                        "type": "dir",
+                        "path": rel_path,
+                        "children": build_tree(entry.path, max_depth, cur_depth + 1)
+                    })
+                else:
+                    items.append({
+                        "name": entry.name,
+                        "type": "file",
+                        "path": rel_path,
+                        "size": entry.stat().st_size
+                    })
+        except Exception:
+            pass
+        return items
+
+    return {"root": "OmniPlus Workspace", "tree": build_tree(".")}
+
+
+@app.get("/api/files/content")
+async def get_file_content(path: str):
+    """Safely read and return file contents."""
+    norm_path = os.path.normpath(path)
+    if norm_path.startswith("..") or os.path.isabs(norm_path):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.exists(norm_path) or not os.path.isfile(norm_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        with open(norm_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(60000)
+        return {
+            "path": norm_path.replace("\\", "/"),
+            "content": content,
+            "size": os.path.getsize(norm_path)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/search")
+async def run_web_search(q: str):
+    """Run direct DuckDuckGo search."""
+    if not q or not q.strip():
+        return {"query": "", "results": []}
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(q.strip(), max_results=8))
+        return {"query": q, "results": results}
+    except Exception as e:
+        return {"query": q, "results": [], "error": str(e)}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     if not req.message.strip():
@@ -87,6 +193,23 @@ async def chat_endpoint(req: ChatRequest):
         return ChatResponse(response=reply, tools=assistant.get_tool_names())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Server-Sent Events endpoint for real-time token and tool streaming."""
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    assistant = await get_or_create_assistant()
+
+    async def event_generator():
+        try:
+            async for ev in assistant.stream_chat(req.message.strip()):
+                yield f"data: {json.dumps(ev)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/api/clear")
@@ -111,6 +234,8 @@ HTML_CONTENT = """<!DOCTYPE html>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
   <style>
     :root {
       --bg: #070913;
@@ -160,6 +285,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 0.75rem;
+      cursor: pointer;
     }
     .brand-logo {
       width: 38px;
@@ -235,9 +361,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       color: #fff;
       border-color: rgba(255, 255, 255, 0.15);
     }
-    .nav-btn.danger {
-      color: #f87171;
-    }
+    .nav-btn.danger { color: #f87171; }
     .nav-btn.danger:hover {
       background: rgba(239, 68, 68, 0.12);
       border-color: rgba(239, 68, 68, 0.3);
@@ -371,6 +495,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       overflow-y: auto;
       padding-right: 0.35rem;
       gap: 1.25rem;
+      position: relative;
     }
     .center-workspace::-webkit-scrollbar {
       width: 6px;
@@ -378,6 +503,18 @@ HTML_CONTENT = """<!DOCTYPE html>
     .center-workspace::-webkit-scrollbar-thumb {
       background: rgba(255, 255, 255, 0.1);
       border-radius: 4px;
+    }
+
+    /* DEDICATED VIEW CONTAINERS */
+    .view-container {
+      display: none;
+      flex-direction: column;
+      gap: 1.25rem;
+      flex: 1;
+      animation: fadeIn 0.2s ease-out;
+    }
+    .view-container.active-view {
+      display: flex;
     }
 
     /* HERO BANNER */
@@ -458,20 +595,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       border-color: rgba(99, 102, 241, 0.4);
       transform: translateY(-2px);
     }
-    .pill-icon {
-      font-size: 1.15rem;
-    }
-    .pill-text h5 {
-      font-size: 0.8rem;
-      font-weight: 700;
-      color: #fff;
-    }
-    .pill-text p {
-      font-size: 0.68rem;
-      color: var(--text-dim);
-    }
+    .pill-icon { font-size: 1.15rem; }
+    .pill-text h5 { font-size: 0.8rem; font-weight: 700; color: #fff; }
+    .pill-text p { font-size: 0.68rem; color: var(--text-dim); }
 
-    /* HERO ARTWORK (COSMIC PLANET + ROBOT) */
     .hero-art {
       width: 250px;
       height: 180px;
@@ -542,7 +669,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       background: #10b981;
     }
 
-    /* 4 FEATURE CARDS GRID */
+    /* 4 FEATURE CARDS */
     .features-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -557,8 +684,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       flex-direction: column;
       justify-content: space-between;
       min-height: 220px;
-      position: relative;
-      overflow: hidden;
       cursor: pointer;
       transition: all 0.25s ease;
     }
@@ -595,26 +720,9 @@ HTML_CONTENT = """<!DOCTYPE html>
       transform: scale(1.08);
       opacity: 1;
     }
-    .card-body h4 {
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: #fff;
-      margin-bottom: 0.2rem;
-    }
-    .card-tag {
-      font-size: 0.65rem;
-      font-weight: 700;
-      color: #818cf8;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-bottom: 0.5rem;
-      display: inline-block;
-    }
-    .card-body p {
-      font-size: 0.74rem;
-      color: var(--text-muted);
-      line-height: 1.45;
-    }
+    .card-body h4 { font-size: 0.95rem; font-weight: 700; color: #fff; margin-bottom: 0.2rem; }
+    .card-tag { font-size: 0.65rem; font-weight: 700; color: #818cf8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; display: inline-block; }
+    .card-body p { font-size: 0.74rem; color: var(--text-muted); line-height: 1.45; }
     .card-footer {
       display: flex;
       align-items: center;
@@ -635,13 +743,130 @@ HTML_CONTENT = """<!DOCTYPE html>
       font-size: 0.85rem;
       transition: all 0.2s;
     }
-    .feature-card:hover .arrow-btn {
-      background: var(--primary);
-      color: #fff;
-      transform: translateX(3px);
-    }
+    .feature-card:hover .arrow-btn { background: var(--primary); color: #fff; transform: translateX(3px); }
 
-    /* FLOATING CHAT INPUT BAR */
+    /* CONVERSATION DRAWER (STREAMING) */
+    .chat-drawer {
+      display: none;
+      flex-direction: column;
+      gap: 1rem;
+      background: #0a0e1c;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.25rem;
+      max-height: 480px;
+      overflow-y: auto;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+    .chat-drawer.open { display: flex; }
+    .drawer-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.75rem;
+    }
+    .drawer-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .drawer-controls {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .mini-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 0.3rem 0.65rem;
+      border-radius: 8px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .mini-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+    /* STREAMING MESSAGES */
+    .msg-group { display: flex; flex-direction: column; gap: 1rem; }
+    .msg { display: flex; gap: 0.75rem; max-width: 90%; animation: fadeIn 0.2s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+    .msg.assistant { align-self: flex-start; }
+    .msg-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.95rem;
+      flex-shrink: 0;
+    }
+    .msg.user .msg-avatar { background: #4338ca; }
+    .msg.assistant .msg-avatar { background: linear-gradient(135deg, #0ea5e9, #6366f1); box-shadow: 0 0 15px rgba(14, 165, 233, 0.35); }
+    .msg-bubble {
+      padding: 0.85rem 1.15rem;
+      border-radius: 16px;
+      font-size: 0.9rem;
+      line-height: 1.55;
+      position: relative;
+    }
+    .msg.user .msg-bubble { background: #1e1b4b; border: 1px solid rgba(99, 102, 241, 0.3); color: #e0e7ff; border-top-right-radius: 4px; }
+    .msg.assistant .msg-bubble { background: #11172a; border: 1px solid var(--border); color: var(--text); border-top-left-radius: 4px; width: 100%; }
+
+    /* TOOL CALL BADGE IN CHAT */
+    .tool-badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      color: #a5b4fc;
+      border-radius: 12px;
+      padding: 0.3rem 0.65rem;
+      font-size: 0.75rem;
+      font-family: 'JetBrains Mono', monospace;
+      margin-bottom: 0.6rem;
+      animation: pulseGlow 1.5s infinite;
+    }
+    @keyframes pulseGlow { 0%, 100% { border-color: rgba(99, 102, 241, 0.35); } 50% { border-color: #818cf8; } }
+
+    /* SYNTAX CODE BLOCK WITH COPY BUTTON */
+    .code-container {
+      position: relative;
+      margin: 0.75rem 0;
+    }
+    .code-container pre {
+      background: #090c16;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 1rem;
+      border-radius: 10px;
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.83rem;
+    }
+    .code-copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: #cbd5e1;
+      padding: 0.25rem 0.55rem;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .code-copy-btn:hover { background: #4f46e5; color: #fff; }
+
+    /* FLOATING CHAT INPUT BAR WITH SPEECH MIC */
     .chat-input-bar {
       margin-top: auto;
       background: #0e1428;
@@ -650,16 +875,13 @@ HTML_CONTENT = """<!DOCTYPE html>
       padding: 0.45rem 0.65rem 0.45rem 1.25rem;
       display: flex;
       align-items: center;
-      gap: 0.75rem;
+      gap: 0.6rem;
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 20px rgba(99, 102, 241, 0.15);
       position: sticky;
       bottom: 0;
       z-index: 50;
     }
-    .chat-sparkle {
-      font-size: 1.15rem;
-      color: #a855f7;
-    }
+    .chat-sparkle { font-size: 1.15rem; color: #a855f7; }
     .chat-input-bar input {
       flex: 1;
       background: transparent;
@@ -669,8 +891,21 @@ HTML_CONTENT = """<!DOCTYPE html>
       color: #fff;
       font-family: inherit;
     }
-    .chat-input-bar input::placeholder {
-      color: var(--text-dim);
+    .chat-input-bar input::placeholder { color: var(--text-dim); }
+    .mic-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 1.1rem;
+      padding: 0.3rem 0.5rem;
+      border-radius: 50%;
+      transition: all 0.2s;
+    }
+    .mic-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.05); }
+    .mic-btn.listening {
+      color: #ef4444;
+      animation: pulse 1s infinite;
     }
     .send-pill-btn {
       background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
@@ -688,13 +923,147 @@ HTML_CONTENT = """<!DOCTYPE html>
       transition: all 0.2s ease;
       box-shadow: 0 4px 14px rgba(79, 70, 229, 0.4);
     }
-    .send-pill-btn:hover {
-      opacity: 0.92;
-      transform: scale(1.02);
+    .send-pill-btn:hover { opacity: 0.92; transform: scale(1.02); }
+    .send-pill-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* DEDICATED PANELS (FILES, SEARCH, TOOLS, GITHUB, SETTINGS) */
+    .view-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
     }
-    .send-pill-btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
+    .view-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .view-title { font-size: 1.2rem; font-weight: 800; color: #fff; display: flex; align-items: center; gap: 0.5rem; }
+
+    /* FILE TREE VIEW */
+    .file-explorer {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 1rem;
+      min-height: 400px;
+    }
+    .tree-pane {
+      background: #090c16;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0.85rem;
+      overflow-y: auto;
+      max-height: 500px;
+    }
+    .tree-item {
+      padding: 0.35rem 0.55rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    .tree-item:hover { background: rgba(255, 255, 255, 0.05); color: #fff; }
+    .tree-item.selected { background: #2e266d; color: #fff; }
+    .code-viewer-pane {
+      background: #090c16;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .code-viewer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.5rem;
+    }
+    .code-pre-box {
+      flex: 1;
+      overflow: auto;
+      max-height: 420px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      color: #e2e8f0;
+      white-space: pre-wrap;
+    }
+
+    /* WEB SEARCH EXPLORER */
+    .search-input-box {
+      display: flex;
+      gap: 0.65rem;
+    }
+    .search-bar {
+      flex: 1;
+      background: #090c16;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      color: #fff;
+      font-family: inherit;
+      outline: none;
+    }
+    .search-results-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      max-height: 500px;
+      overflow-y: auto;
+    }
+    .search-card {
+      background: #090c16;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      transition: all 0.2s;
+    }
+    .search-card:hover { border-color: rgba(99, 102, 241, 0.4); transform: translateY(-2px); }
+    .search-card h4 { font-size: 0.95rem; color: #60a5fa; margin-bottom: 0.2rem; }
+    .search-card a { font-size: 0.72rem; color: var(--text-dim); text-decoration: none; word-break: break-all; }
+    .search-card p { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem; line-height: 1.45; }
+
+    /* TOOLS PLAYGROUND */
+    .tools-list-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .tool-box-card {
+      background: #090c16;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .tool-box-card h4 { font-size: 0.9rem; color: #34d399; margin-bottom: 0.4rem; font-family: 'JetBrains Mono', monospace; }
+    .tool-box-card p { font-size: 0.76rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 0.75rem; }
+
+    /* SETTINGS VIEW */
+    .settings-form {
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      max-width: 600px;
+    }
+    .form-group { display: flex; flex-direction: column; gap: 0.4rem; }
+    .form-label { font-size: 0.82rem; font-weight: 600; color: #cbd5e1; }
+    .form-input {
+      background: #090c16;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.65rem 0.9rem;
+      color: #fff;
+      font-family: inherit;
     }
 
     /* RIGHT SIDEBAR */
@@ -705,130 +1074,37 @@ HTML_CONTENT = """<!DOCTYPE html>
       height: 100%;
       overflow-y: auto;
     }
-    .sidebar-right::-webkit-scrollbar {
-      width: 4px;
-    }
-    .sidebar-right::-webkit-scrollbar-thumb {
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-    }
+    .sidebar-right::-webkit-scrollbar { width: 4px; }
+    .sidebar-right::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 4px; }
     .panel-box {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 16px;
       padding: 1.1rem;
     }
-    .panel-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      margin-bottom: 0.85rem;
-    }
-    .panel-title {
-      font-size: 0.88rem;
-      font-weight: 700;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-    }
-    .panel-link {
-      font-size: 0.72rem;
-      color: #6366f1;
-      text-decoration: none;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .panel-desc {
-      font-size: 0.72rem;
-      color: var(--text-dim);
-      margin-top: -0.5rem;
-      margin-bottom: 0.75rem;
-    }
-    .action-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.65rem 0.6rem;
-      border-radius: 10px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .action-row:hover {
-      background: rgba(255, 255, 255, 0.04);
-    }
-    .action-left {
-      display: flex;
-      align-items: center;
-      gap: 0.65rem;
-    }
-    .action-icon {
-      width: 32px;
-      height: 32px;
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.04);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.95rem;
-    }
-    .action-meta h5 {
-      font-size: 0.8rem;
-      font-weight: 700;
-      color: #fff;
-    }
-    .action-meta p {
-      font-size: 0.68rem;
-      color: var(--text-dim);
-    }
-    .chevron-right {
-      color: var(--text-dim);
-      font-size: 0.85rem;
-      transition: all 0.2s;
-    }
-    .action-row:hover .chevron-right {
-      color: #fff;
-      transform: translateX(2px);
-    }
+    .panel-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.85rem; }
+    .panel-title { font-size: 0.88rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 0.4rem; }
+    .panel-desc { font-size: 0.72rem; color: var(--text-dim); margin-top: -0.5rem; margin-bottom: 0.75rem; }
+    .action-row { display: flex; align-items: center; justify-content: space-between; padding: 0.65rem 0.6rem; border-radius: 10px; cursor: pointer; transition: all 0.2s; }
+    .action-row:hover { background: rgba(255, 255, 255, 0.04); }
+    .action-left { display: flex; align-items: center; gap: 0.65rem; }
+    .action-icon { width: 32px; height: 32px; border-radius: 8px; background: rgba(255, 255, 255, 0.04); display: flex; align-items: center; justify-content: center; font-size: 0.95rem; }
+    .action-meta h5 { font-size: 0.8rem; font-weight: 700; color: #fff; }
+    .action-meta p { font-size: 0.68rem; color: var(--text-dim); }
+    .chevron-right { color: var(--text-dim); font-size: 0.85rem; transition: all 0.2s; }
+    .action-row:hover .chevron-right { color: #fff; transform: translateX(2px); }
 
     /* ACTIVITY STREAM */
-    .activity-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-    .activity-item {
-      display: flex;
-      align-items: center;
-      gap: 0.65rem;
-      padding: 0.5rem 0.4rem;
-      border-radius: 8px;
-    }
-    .activity-icon {
-      width: 28px;
-      height: 28px;
-      border-radius: 7px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.85rem;
-      flex-shrink: 0;
-    }
+    .activity-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .activity-item { display: flex; align-items: center; gap: 0.65rem; padding: 0.5rem 0.4rem; border-radius: 8px; }
+    .activity-icon { width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; font-size: 0.85rem; flex-shrink: 0; }
     .icon-blue { background: rgba(14, 165, 233, 0.15); color: #38bdf8; }
     .icon-amber { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
     .icon-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
     .icon-green { background: rgba(16, 185, 129, 0.15); color: #34d399; }
-    .activity-text h6 {
-      font-size: 0.77rem;
-      font-weight: 600;
-      color: #e2e8f0;
-    }
-    .activity-text span {
-      font-size: 0.67rem;
-      color: var(--text-dim);
-    }
+    .activity-text h6 { font-size: 0.77rem; font-weight: 600; color: #e2e8f0; }
+    .activity-text span { font-size: 0.67rem; color: var(--text-dim); }
 
-    /* PROMO MOUNTAIN RIGHT */
     .promo-mountain-card {
       background: linear-gradient(135deg, #131433 0%, #0c1228 100%);
       border: 1px solid rgba(99, 102, 241, 0.2);
@@ -838,159 +1114,18 @@ HTML_CONTENT = """<!DOCTYPE html>
       overflow: hidden;
       margin-top: auto;
     }
-    .promo-mountain-card h4 {
-      font-size: 0.88rem;
-      font-weight: 700;
-      color: #fff;
-      margin-bottom: 0.15rem;
-    }
-    .promo-mountain-card p {
-      font-size: 0.72rem;
-      color: var(--text-muted);
-    }
-    .promo-mountain-card svg {
-      width: 100%;
-      height: 70px;
-      margin-top: 0.5rem;
-    }
-
-    /* CONVERSATION OVERLAY DRAWER */
-    .chat-drawer {
-      display: none;
-      flex-direction: column;
-      gap: 1rem;
-      background: #0a0e1c;
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 1.25rem;
-      max-height: 480px;
-      overflow-y: auto;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-    }
-    .chat-drawer.open {
-      display: flex;
-    }
-    .drawer-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 0.75rem;
-    }
-    .drawer-title {
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-    }
-    .close-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-dim);
-      font-size: 1.1rem;
-      cursor: pointer;
-    }
-    .close-btn:hover { color: #fff; }
-
-    /* MESSAGE BUBBLE STYLING */
-    .msg-group {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-    .msg {
-      display: flex;
-      gap: 0.75rem;
-      max-width: 88%;
-      animation: fadeIn 0.2s ease-out;
-    }
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(4px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-    .msg.user {
-      align-self: flex-end;
-      flex-direction: row-reverse;
-    }
-    .msg.assistant {
-      align-self: flex-start;
-    }
-    .msg-avatar {
-      width: 32px;
-      height: 32px;
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.95rem;
-      flex-shrink: 0;
-    }
-    .msg.user .msg-avatar {
-      background: #4338ca;
-    }
-    .msg.assistant .msg-avatar {
-      background: linear-gradient(135deg, #0ea5e9, #6366f1);
-      box-shadow: 0 0 15px rgba(14, 165, 233, 0.35);
-    }
-    .msg-bubble {
-      padding: 0.85rem 1.15rem;
-      border-radius: 16px;
-      font-size: 0.9rem;
-      line-height: 1.55;
-    }
-    .msg.user .msg-bubble {
-      background: #1e1b4b;
-      border: 1px solid rgba(99, 102, 241, 0.3);
-      color: #e0e7ff;
-      border-top-right-radius: 4px;
-    }
-    .msg.assistant .msg-bubble {
-      background: #11172a;
-      border: 1px solid var(--border);
-      color: var(--text);
-      border-top-left-radius: 4px;
-    }
-    .msg-bubble pre {
-      background: #090c16;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      padding: 0.75rem;
-      border-radius: 8px;
-      overflow-x: auto;
-      margin: 0.5rem 0;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-    }
-    .msg-bubble code {
-      background: rgba(255, 255, 255, 0.1);
-      padding: 0.15rem 0.3rem;
-      border-radius: 4px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-    }
-    .msg-bubble pre code { background: none; padding: 0; }
-    .msg-bubble p:not(:last-child) { margin-bottom: 0.5rem; }
-
-    .spinner {
-      display: inline-block;
-      width: 14px;
-      height: 14px;
-      border: 2px solid rgba(255, 255, 255, 0.3);
-      border-radius: 50%;
-      border-top-color: #fff;
-      animation: spin 0.8s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .promo-mountain-card h4 { font-size: 0.88rem; font-weight: 700; color: #fff; margin-bottom: 0.15rem; }
+    .promo-mountain-card p { font-size: 0.72rem; color: var(--text-muted); }
+    .promo-mountain-card svg { width: 100%; height: 70px; margin-top: 0.5rem; }
   </style>
 </head>
 <body>
 
   <!-- TOP HEADER -->
   <header class="top-nav">
-    <div class="brand">
+    <div class="brand" onclick="switchView('home')">
       <div class="brand-logo">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2">
           <rect x="3" y="11" width="18" height="10" rx="2"></rect>
           <circle cx="12" cy="5" r="2"></circle>
           <path d="M12 7v4"></path>
@@ -1005,16 +1140,19 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="nav-right">
       <div class="status-pill">
         <span class="status-dot"></span>
-        <span>Ready</span>
+        <span id="navModelStatus">Ready • gemini-3.5-flash</span>
       </div>
-      <button class="nav-btn" onclick="quickPrompt('Inspect and list files in this project workspace.')">
+      <button class="nav-btn" onclick="switchView('files')">
         <span>📁</span> Files
       </button>
-      <button class="nav-btn" onclick="quickPrompt('Search the web for the latest updates on Model Context Protocol.')">
+      <button class="nav-btn" onclick="switchView('search')">
         <span>🌐</span> Search
       </button>
-      <button class="nav-btn" onclick="quickPrompt('Check GitHub integration status and loaded tools.')">
+      <button class="nav-btn" onclick="switchView('github')">
         <span>🐙</span> GitHub
+      </button>
+      <button class="nav-btn" onclick="exportConversation()" title="Export chat history as markdown">
+        <span>📥</span> Export
       </button>
       <button class="nav-btn danger" onclick="clearAllChat()">
         <span>🧹</span> Clear
@@ -1028,27 +1166,27 @@ HTML_CONTENT = """<!DOCTYPE html>
     <!-- LEFT SIDEBAR -->
     <aside class="sidebar-left">
       <div class="nav-menu">
-        <a class="nav-item active" href="#" onclick="selectNav(this, 'home')">
+        <a class="nav-item active" id="nav-home" href="#" onclick="switchView('home')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
           <span>Home</span>
         </a>
-        <a class="nav-item" href="#" onclick="selectNav(this, 'files')">
+        <a class="nav-item" id="nav-files" href="#" onclick="switchView('files')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
           <span>Files</span>
         </a>
-        <a class="nav-item" href="#" onclick="selectNav(this, 'search')">
+        <a class="nav-item" id="nav-search" href="#" onclick="switchView('search')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
           <span>Search</span>
         </a>
-        <a class="nav-item" href="#" onclick="selectNav(this, 'github')">
+        <a class="nav-item" id="nav-github" href="#" onclick="switchView('github')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>
           <span>GitHub</span>
         </a>
-        <a class="nav-item" href="#" onclick="selectNav(this, 'tools')">
+        <a class="nav-item" id="nav-tools" href="#" onclick="switchView('tools')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
           <span>Tools</span>
         </a>
-        <a class="nav-item" href="#" onclick="selectNav(this, 'settings')">
+        <a class="nav-item" id="nav-settings" href="#" onclick="switchView('settings')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
           <span>Settings</span>
         </a>
@@ -1076,7 +1214,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
 
         <!-- USER STATUS FOOTER -->
-        <div class="user-footer" onclick="quickPrompt('Display OmniPlus configuration and model details.')">
+        <div class="user-footer" onclick="switchView('settings')">
           <div class="user-info">
             <div class="user-avatar">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5">
@@ -1094,235 +1232,329 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </aside>
 
-    <!-- CENTER MAIN WORKSPACE -->
+    <!-- CENTER WORKSPACE -->
     <main class="center-workspace">
 
-      <!-- HERO BANNER -->
-      <section class="hero-banner">
-        <div class="hero-content">
-          <h2 class="hero-title">
-            <span class="wave">👋</span> Good <span id="timeGreeting">morning</span>, <span>Explorer!</span>
-          </h2>
-          <p class="hero-subtitle">
-            Your AI-powered workspace is ready. Ask OmniPlus anything or explore your tools to get started.
+      <!-- VIEW 1: HOME DASHBOARD -->
+      <div class="view-container active-view" id="view-home">
+        <!-- HERO BANNER -->
+        <section class="hero-banner">
+          <div class="hero-content">
+            <h2 class="hero-title">
+              <span class="wave">👋</span> Good <span id="timeGreeting">morning</span>, <span>Explorer!</span>
+            </h2>
+            <p class="hero-subtitle">
+              Your AI-powered workspace is ready. Ask OmniPlus anything or explore your tools to get started.
+            </p>
+
+            <div class="hero-actions">
+              <div class="hero-action-pill" onclick="quickPrompt('Search the web for top trending AI frameworks in 2026.')">
+                <span class="pill-icon">🌐</span>
+                <div class="pill-text">
+                  <h5>Search the web</h5>
+                  <p>Get latest info & docs</p>
+                </div>
+              </div>
+
+              <div class="hero-action-pill" onclick="quickPrompt('Inspect and summarize the files in this workspace.')">
+                <span class="pill-icon">📁</span>
+                <div class="pill-text">
+                  <h5>Inspect files</h5>
+                  <p>Explore your project</p>
+                </div>
+              </div>
+
+              <div class="hero-action-pill" onclick="quickPrompt('Explain how OmniPlus utilizes the Model Context Protocol.')">
+                <span class="pill-icon">✨</span>
+                <div class="pill-text">
+                  <h5>Ask Gemini</h5>
+                  <p>Use MCP tools</p>
+                </div>
+              </div>
+
+              <div class="hero-action-pill" onclick="quickPrompt('List all active MCP tools and demonstrate one.')">
+                <span class="pill-icon">🔧</span>
+                <div class="pill-text">
+                  <h5>Run tools</h5>
+                  <p>Execute MCP actions</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- COSMIC PLANET + ROBOT GRAPHIC -->
+          <div class="hero-art">
+            <div class="planet-glow"></div>
+            <svg class="robot-cliff" viewBox="0 0 200 160" fill="none">
+              <path d="M0 160 L50 115 L110 90 L160 110 L200 160 Z" fill="#0c1228" opacity="0.95"/>
+              <path d="M70 160 L120 85 L180 120 L200 160 Z" fill="#141935" opacity="0.85"/>
+              <path d="M95 105 L155 100 L185 160 L75 160 Z" fill="#080b18"/>
+              <g transform="translate(125, 60)">
+                <rect x="10" y="2" width="22" height="18" rx="6" fill="#e2e8f0"/>
+                <rect x="13" y="6" width="16" height="9" rx="3" fill="#0f172a"/>
+                <ellipse cx="17" cy="10" rx="1.8" ry="2.2" fill="#38bdf8"/>
+                <ellipse cx="25" cy="10" rx="1.8" ry="2.2" fill="#38bdf8"/>
+                <line x1="21" y1="2" x2="21" y2="-4" stroke="#94a3b8" stroke-width="1.8"/>
+                <circle cx="21" cy="-5" r="2" fill="#818cf8"/>
+                <rect x="8" y="22" width="26" height="24" rx="7" fill="#cbd5e1"/>
+                <circle cx="21" cy="32" r="4.5" fill="#38bdf8" opacity="0.8"/>
+                <rect x="4" y="42" width="16" height="7" rx="3" fill="#94a3b8"/>
+                <rect x="22" y="42" width="16" height="7" rx="3" fill="#94a3b8"/>
+                <polygon points="26,38 42,38 40,44 24,44" fill="#64748b"/>
+                <polygon points="34,26 44,26 42,38 32,38" fill="#38bdf8" opacity="0.9"/>
+                <ellipse cx="33" cy="40" rx="8" ry="2" fill="#38bdf8" opacity="0.6"/>
+              </g>
+            </svg>
+          </div>
+        </section>
+
+        <!-- EXPLORE WITH OMNIPLUS SECTION -->
+        <section>
+          <div class="explore-header">
+            <div class="explore-title-group">
+              <h3 class="explore-title">
+                <span style="color: #a855f7;">✨</span> Explore with OmniPlus
+              </h3>
+              <p class="explore-subtitle">Powerful tools, all in one place. Choose what you want to do.</p>
+            </div>
+
+            <div class="mcp-status-tag">
+              <span class="dot"></span>
+              <span>MCP Connected</span>
+            </div>
+          </div>
+
+          <!-- 4 FEATURE CARDS -->
+          <div class="features-grid">
+            <div class="feature-card" onclick="quickPrompt('Search the web for Model Context Protocol news.')">
+              <div>
+                <div class="card-top">
+                  <div class="card-icon-wrap" style="color: #38bdf8;">🔍</div>
+                  <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
+                    <circle cx="45" cy="30" r="24" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.7"/>
+                    <ellipse cx="45" cy="30" rx="24" ry="10" stroke="#38bdf8" stroke-width="1.2" opacity="0.8"/>
+                    <ellipse cx="45" cy="30" rx="10" ry="24" stroke="#38bdf8" stroke-width="1.2" opacity="0.8"/>
+                    <circle cx="58" cy="22" r="3" fill="#0ea5e9"/>
+                  </svg>
+                </div>
+                <div class="card-body">
+                  <h4>Search Web</h4>
+                  <span class="card-tag">MCP</span>
+                  <p>Get the latest information, docs, and real-time data from the web.</p>
+                </div>
+              </div>
+              <div class="card-footer">
+                <span style="font-size: 0.72rem; color: var(--text-dim);">DuckDuckGo & Brave</span>
+                <div class="arrow-btn">→</div>
+              </div>
+            </div>
+
+            <div class="feature-card" onclick="switchView('files')">
+              <div>
+                <div class="card-top">
+                  <div class="card-icon-wrap" style="color: #34d399;">📁</div>
+                  <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
+                    <path d="M20 22 C20 18, 22 16, 26 16 L38 16 L44 22 L68 22 C72 22, 74 24, 74 28 L74 46 C74 50, 72 52, 68 52 L26 52 C22 52, 20 50, 20 46 Z" fill="#065f46" opacity="0.6"/>
+                    <path d="M12 28 C12 24, 14 22, 18 22 L30 22 L36 28 L60 28 C64 28, 66 30, 66 34 L66 52 C66 56, 64 58, 60 58 L18 58 C14 58, 12 56, 12 52 Z" fill="#047857" opacity="0.8"/>
+                    <path d="M8 34 C8 30, 10 28, 14 28 L26 28 L32 34 L54 34 C58 34, 60 36, 60 40 L60 56 C60 60, 58 62, 54 62 L14 62 C10 62, 8 60, 8 56 Z" fill="#10b981"/>
+                  </svg>
+                </div>
+                <div class="card-body">
+                  <h4>Inspect Files</h4>
+                  <span class="card-tag">MCP</span>
+                  <p>Read, analyze and explore your project files and structure.</p>
+                </div>
+              </div>
+              <div class="card-footer">
+                <span style="font-size: 0.72rem; color: var(--text-dim);">Filesystem MCP</span>
+                <div class="arrow-btn">→</div>
+              </div>
+            </div>
+
+            <div class="feature-card" onclick="quickPrompt('How can I use OmniPlus to optimize my software development?')">
+              <div>
+                <div class="card-top">
+                  <div class="card-icon-wrap" style="color: #c084fc;">✨</div>
+                  <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
+                    <path d="M50 10 L53 22 L65 25 L53 28 L50 40 L47 28 L35 25 L47 22 Z" fill="#c084fc"/>
+                    <path d="M26 28 L28 35 L35 37 L28 39 L26 46 L24 39 L17 37 L24 35 Z" fill="#a855f7" opacity="0.75"/>
+                  </svg>
+                </div>
+                <div class="card-body">
+                  <h4>Ask Gemini</h4>
+                  <span class="card-tag">MCP</span>
+                  <p>Get intelligent responses using Google Gemini and MCP tools.</p>
+                </div>
+              </div>
+              <div class="card-footer">
+                <span style="font-size: 0.72rem; color: var(--text-dim);">Multi-Model Failover</span>
+                <div class="arrow-btn">→</div>
+              </div>
+            </div>
+
+            <div class="feature-card" onclick="switchView('tools')">
+              <div>
+                <div class="card-top">
+                  <div class="card-icon-wrap" style="color: #2dd4bf;">🔧</div>
+                  <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
+                    <rect x="20" y="14" width="55" height="40" rx="7" fill="#0f172a" stroke="#2dd4bf" stroke-width="1.2" opacity="0.9"/>
+                    <line x1="20" y1="24" x2="75" y2="24" stroke="#2dd4bf" stroke-width="1" opacity="0.5"/>
+                    <path d="M30 36 L36 41 L30 46" stroke="#2dd4bf" stroke-width="2" stroke-linecap="round"/>
+                  </svg>
+                </div>
+                <div class="card-body">
+                  <h4>Run Tools</h4>
+                  <span class="card-tag">MCP</span>
+                  <p>Execute MCP tools and automate your workflow.</p>
+                </div>
+              </div>
+              <div class="card-footer">
+                <span style="font-size: 0.72rem; color: var(--text-dim);">Interactive Sandbox</span>
+                <div class="arrow-btn">→</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- VIEW 2: FILES EXPLORER -->
+      <div class="view-container" id="view-files">
+        <div class="view-card">
+          <div class="view-header">
+            <h3 class="view-title"><span>📁</span> Workspace File Explorer</h3>
+            <button class="nav-btn" onclick="refreshFileTree()"><span>🔄</span> Refresh</button>
+          </div>
+          <div class="file-explorer">
+            <div class="tree-pane" id="fileTreePane">
+              <p style="color: var(--text-dim); font-size: 0.8rem;">Loading workspace files...</p>
+            </div>
+            <div class="code-viewer-pane">
+              <div class="code-viewer-header">
+                <span id="selectedFileName" style="font-size: 0.85rem; font-weight: 700; color: #a5b4fc;">No file selected</span>
+                <div style="display: flex; gap: 0.5rem;">
+                  <button class="mini-btn" onclick="askAiAboutFile()">✨ Explain with OmniPlus</button>
+                  <button class="mini-btn" onclick="copyCurrentFile()">📋 Copy</button>
+                </div>
+              </div>
+              <div class="code-pre-box" id="fileContentPre">// Click a file on the left to preview contents</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 3: WEB SEARCH EXPLORER -->
+      <div class="view-container" id="view-search">
+        <div class="view-card">
+          <div class="view-header">
+            <h3 class="view-title"><span>🌐</span> Live Web Search</h3>
+          </div>
+          <div class="search-input-box">
+            <input type="text" class="search-bar" id="webSearchInput" placeholder="Search the internet using DuckDuckGo FastMCP..." />
+            <button class="send-pill-btn" onclick="executeWebSearch()">Search</button>
+          </div>
+          <div class="search-results-grid" id="searchResultsGrid">
+            <p style="color: var(--text-dim); font-size: 0.85rem;">Enter a query above to fetch real-time search results.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 4: GITHUB VIEW -->
+      <div class="view-container" id="view-github">
+        <div class="view-card">
+          <div class="view-header">
+            <h3 class="view-title"><span>🐙</span> GitHub Integration</h3>
+            <a href="https://github.com/chethangowda-web/OmniPlus" target="_blank" class="nav-btn">Open on GitHub ↗</a>
+          </div>
+          <p style="color: var(--text-muted); font-size: 0.88rem; line-height: 1.6;">
+            OmniPlus connects to GitHub through <b>@modelcontextprotocol/server-github</b>. You can query open issues, inspect PRs, browse commits, and search across repositories.
           </p>
-
-          <div class="hero-actions">
-            <div class="hero-action-pill" onclick="quickPrompt('Search the web for top trending AI frameworks in 2026.')">
-              <span class="pill-icon">🌐</span>
-              <div class="pill-text">
-                <h5>Search the web</h5>
-                <p>Get latest info & docs</p>
-              </div>
-            </div>
-
-            <div class="hero-action-pill" onclick="quickPrompt('Inspect and summarize the files in this workspace.')">
-              <span class="pill-icon">📁</span>
-              <div class="pill-text">
-                <h5>Inspect files</h5>
-                <p>Explore your project</p>
-              </div>
-            </div>
-
-            <div class="hero-action-pill" onclick="quickPrompt('Explain how OmniPlus utilizes the Model Context Protocol.')">
-              <span class="pill-icon">✨</span>
-              <div class="pill-text">
-                <h5>Ask Gemini</h5>
-                <p>Use MCP tools</p>
-              </div>
-            </div>
-
-            <div class="hero-action-pill" onclick="quickPrompt('List all active MCP tools and demonstrate one.')">
-              <span class="pill-icon">🔧</span>
-              <div class="pill-text">
-                <h5>Run tools</h5>
-                <p>Execute MCP actions</p>
-              </div>
+          <div style="background: #090c16; border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem;">
+            <h4 style="font-size: 0.92rem; color: #fff; margin-bottom: 0.5rem;">Quick GitHub Actions</h4>
+            <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+              <button class="nav-btn" style="justify-content: flex-start;" onclick="quickPrompt('List the latest commits on the active branch.')">
+                📌 List recent commits
+              </button>
+              <button class="nav-btn" style="justify-content: flex-start;" onclick="quickPrompt('Inspect open issues and pull requests in this repository.')">
+                📋 Inspect open issues & PRs
+              </button>
+              <button class="nav-btn" style="justify-content: flex-start;" onclick="quickPrompt('Perform a code review of the latest changes in OmniPlus.')">
+                🔍 Perform AI Code Review
+              </button>
             </div>
           </div>
         </div>
+      </div>
 
-        <!-- 3D COSMIC PLANET + ROBOT GRAPHIC -->
-        <div class="hero-art">
-          <div class="planet-glow"></div>
-          <svg class="robot-cliff" viewBox="0 0 200 160" fill="none">
-            <!-- Mountain silhouette -->
-            <path d="M0 160 L50 115 L110 90 L160 110 L200 160 Z" fill="#0c1228" opacity="0.95"/>
-            <path d="M70 160 L120 85 L180 120 L200 160 Z" fill="#141935" opacity="0.85"/>
-            <!-- Cliff ledge -->
-            <path d="M95 105 L155 100 L185 160 L75 160 Z" fill="#080b18"/>
-            <!-- Sitting Robot with Laptop -->
-            <g transform="translate(125, 60)">
-              <!-- Robot Head -->
-              <rect x="10" y="2" width="22" height="18" rx="6" fill="#e2e8f0"/>
-              <!-- Screen eyes -->
-              <rect x="13" y="6" width="16" height="9" rx="3" fill="#0f172a"/>
-              <ellipse cx="17" cy="10" rx="1.8" ry="2.2" fill="#38bdf8"/>
-              <ellipse cx="25" cy="10" rx="1.8" ry="2.2" fill="#38bdf8"/>
-              <!-- Antenna -->
-              <line x1="21" y1="2" x2="21" y2="-4" stroke="#94a3b8" stroke-width="1.8"/>
-              <circle cx="21" cy="-5" r="2" fill="#818cf8"/>
-              <!-- Robot Body -->
-              <rect x="8" y="22" width="26" height="24" rx="7" fill="#cbd5e1"/>
-              <!-- Chest emblem -->
-              <circle cx="21" cy="32" r="4.5" fill="#38bdf8" opacity="0.8"/>
-              <!-- Sitting legs -->
-              <rect x="4" y="42" width="16" height="7" rx="3" fill="#94a3b8"/>
-              <rect x="22" y="42" width="16" height="7" rx="3" fill="#94a3b8"/>
-              <!-- Laptop -->
-              <polygon points="26,38 42,38 40,44 24,44" fill="#64748b"/>
-              <polygon points="34,26 44,26 42,38 32,38" fill="#38bdf8" opacity="0.9"/>
-              <!-- Glowing keyboard glow -->
-              <ellipse cx="33" cy="40" rx="8" ry="2" fill="#38bdf8" opacity="0.6"/>
-            </g>
-          </svg>
-        </div>
-      </section>
-
-      <!-- EXPLORE WITH OMNIPLUS SECTION -->
-      <section>
-        <div class="explore-header">
-          <div class="explore-title-group">
-            <h3 class="explore-title">
-              <span style="color: #a855f7;">✨</span> Explore with OmniPlus
-            </h3>
-            <p class="explore-subtitle">Powerful tools, all in one place. Choose what you want to do.</p>
+      <!-- VIEW 5: MCP TOOLS PLAYGROUND -->
+      <div class="view-container" id="view-tools">
+        <div class="view-card">
+          <div class="view-header">
+            <h3 class="view-title"><span>🔧</span> Loaded MCP Tools Sandbox</h3>
+            <button class="nav-btn" onclick="loadDetailedTools()"><span>🔄</span> Refresh Tools</button>
           </div>
-
-          <div class="mcp-status-tag">
-            <span class="dot"></span>
-            <span>MCP Connected</span>
+          <p style="color: var(--text-dim); font-size: 0.82rem;">Tools loaded via stdio transports and bound to LangChain ReAct Agent.</p>
+          <div class="tools-list-grid" id="toolsDetailedGrid">
+            <p style="color: var(--text-dim);">Loading MCP tools metadata...</p>
           </div>
         </div>
+      </div>
 
-        <!-- 4 FEATURE CARDS -->
-        <div class="features-grid">
-
-          <!-- CARD 1: SEARCH WEB -->
-          <div class="feature-card" onclick="quickPrompt('Search the web for Model Context Protocol news.')">
-            <div>
-              <div class="card-top">
-                <div class="card-icon-wrap" style="color: #38bdf8;">🔍</div>
-                <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
-                  <circle cx="45" cy="30" r="24" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.7"/>
-                  <ellipse cx="45" cy="30" rx="24" ry="10" stroke="#38bdf8" stroke-width="1.2" opacity="0.8"/>
-                  <ellipse cx="45" cy="30" rx="10" ry="24" stroke="#38bdf8" stroke-width="1.2" opacity="0.8"/>
-                  <circle cx="58" cy="22" r="3" fill="#0ea5e9"/>
-                  <circle cx="35" cy="36" r="2" fill="#38bdf8"/>
-                </svg>
-              </div>
-              <div class="card-body">
-                <h4>Search Web</h4>
-                <span class="card-tag">MCP</span>
-                <p>Get the latest information, docs, and real-time data from the web.</p>
-              </div>
+      <!-- VIEW 6: SETTINGS -->
+      <div class="view-container" id="view-settings">
+        <div class="view-card">
+          <div class="view-header">
+            <h3 class="view-title"><span>⚙️</span> System Settings & Quota Manager</h3>
+          </div>
+          <div class="settings-form">
+            <div class="form-group">
+              <label class="form-label">Active Gemini Model</label>
+              <select class="form-input" id="settingModelSelect">
+                <option value="gemini-3.5-flash">gemini-3.5-flash (Fast & Fresh Quota — Recommended)</option>
+                <option value="gemini-flash-latest">gemini-flash-latest</option>
+                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (High RPM)</option>
+                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                <option value="gemma-4-31b-it">gemma-4-31b-it</option>
+              </select>
             </div>
-            <div class="card-footer">
-              <span style="font-size: 0.72rem; color: var(--text-dim);">DuckDuckGo & Brave</span>
-              <div class="arrow-btn">→</div>
+
+            <div class="form-group">
+              <label class="form-label">Google Gemini API Key</label>
+              <input type="password" class="form-input" id="settingApiKeyInput" placeholder="Update Gemini API Key..." />
+              <span style="font-size: 0.72rem; color: var(--text-dim);">Keys are securely stored in your local .env file.</span>
+            </div>
+
+            <button class="send-pill-btn" onclick="saveSystemSettings()" style="align-self: flex-start;">Save Configuration</button>
+
+            <div style="margin-top: 1rem; padding: 1rem; background: #090c16; border: 1px solid var(--border); border-radius: 12px;">
+              <h5 style="color: #fff; font-size: 0.85rem; margin-bottom: 0.5rem;">Automated Failover Pool</h5>
+              <p style="color: var(--text-muted); font-size: 0.78rem; line-height: 1.5;">
+                If your primary model ever encounters Google's free-tier rate limit (429), OmniPlus will automatically hop through:
+                <code style="color: #a5b4fc;">gemini-3.5-flash ➔ gemini-flash-latest ➔ gemini-3.5-flash-lite ➔ gemini-3.1-flash-lite</code>
+              </p>
             </div>
           </div>
-
-          <!-- CARD 2: INSPECT FILES -->
-          <div class="feature-card" onclick="quickPrompt('List and summarize files in the current directory.')">
-            <div>
-              <div class="card-top">
-                <div class="card-icon-wrap" style="color: #34d399;">📁</div>
-                <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
-                  <path d="M20 22 C20 18, 22 16, 26 16 L38 16 L44 22 L68 22 C72 22, 74 24, 74 28 L74 46 C74 50, 72 52, 68 52 L26 52 C22 52, 20 50, 20 46 Z" fill="#065f46" opacity="0.6"/>
-                  <path d="M12 28 C12 24, 14 22, 18 22 L30 22 L36 28 L60 28 C64 28, 66 30, 66 34 L66 52 C66 56, 64 58, 60 58 L18 58 C14 58, 12 56, 12 52 Z" fill="#047857" opacity="0.8"/>
-                  <path d="M8 34 C8 30, 10 28, 14 28 L26 28 L32 34 L54 34 C58 34, 60 36, 60 40 L60 56 C60 60, 58 62, 54 62 L14 62 C10 62, 8 60, 8 56 Z" fill="url(#gradFolder)"/>
-                  <defs>
-                    <linearGradient id="gradFolder" x1="8" y1="28" x2="60" y2="62" gradientUnits="userSpaceOnUse">
-                      <stop stop-color="#10b981"/>
-                      <stop offset="1" stop-color="#047857"/>
-                    </linearGradient>
-                  </defs>
-                </svg>
-              </div>
-              <div class="card-body">
-                <h4>Inspect Files</h4>
-                <span class="card-tag">MCP</span>
-                <p>Read, analyze and explore your project files and structure.</p>
-              </div>
-            </div>
-            <div class="card-footer">
-              <span style="font-size: 0.72rem; color: var(--text-dim);">Filesystem MCP</span>
-              <div class="arrow-btn">→</div>
-            </div>
-          </div>
-
-          <!-- CARD 3: ASK GEMINI -->
-          <div class="feature-card" onclick="quickPrompt('How can I use OmniPlus to optimize my software development?')">
-            <div>
-              <div class="card-top">
-                <div class="card-icon-wrap" style="color: #c084fc;">✨</div>
-                <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
-                  <!-- Sparkling stars -->
-                  <path d="M50 10 L53 22 L65 25 L53 28 L50 40 L47 28 L35 25 L47 22 Z" fill="#c084fc"/>
-                  <path d="M26 28 L28 35 L35 37 L28 39 L26 46 L24 39 L17 37 L24 35 Z" fill="#a855f7" opacity="0.75"/>
-                  <circle cx="62" cy="44" r="3" fill="#e879f9"/>
-                  <circle cx="36" cy="16" r="2" fill="#d8b4fe"/>
-                </svg>
-              </div>
-              <div class="card-body">
-                <h4>Ask Gemini</h4>
-                <span class="card-tag">MCP</span>
-                <p>Get intelligent responses using Google Gemini and MCP tools.</p>
-              </div>
-            </div>
-            <div class="card-footer">
-              <span style="font-size: 0.72rem; color: var(--text-dim);">gemini-2.5-flash</span>
-              <div class="arrow-btn">→</div>
-            </div>
-          </div>
-
-          <!-- CARD 4: RUN TOOLS -->
-          <div class="feature-card" onclick="quickPrompt('List all active MCP tools and show their schema.')">
-            <div>
-              <div class="card-top">
-                <div class="card-icon-wrap" style="color: #2dd4bf;">🔧</div>
-                <svg class="card-illustration" viewBox="0 0 80 60" fill="none">
-                  <!-- Code terminal window -->
-                  <rect x="20" y="14" width="55" height="40" rx="7" fill="#0f172a" stroke="#2dd4bf" stroke-width="1.2" opacity="0.9"/>
-                  <line x1="20" y1="24" x2="75" y2="24" stroke="#2dd4bf" stroke-width="1" opacity="0.5"/>
-                  <circle cx="26" cy="19" r="1.5" fill="#f43f5e"/>
-                  <circle cx="31" cy="19" r="1.5" fill="#facc15"/>
-                  <circle cx="36" cy="19" r="1.5" fill="#10b981"/>
-                  <path d="M30 36 L36 41 L30 46" stroke="#2dd4bf" stroke-width="2" stroke-linecap="round"/>
-                  <line x1="42" y1="46" x2="52" y2="46" stroke="#2dd4bf" stroke-width="2" stroke-linecap="round"/>
-                </svg>
-              </div>
-              <div class="card-body">
-                <h4>Run Tools</h4>
-                <span class="card-tag">MCP</span>
-                <p>Execute MCP tools and automate your workflow.</p>
-              </div>
-            </div>
-            <div class="card-footer">
-              <span style="font-size: 0.72rem; color: var(--text-dim);">Automated ReAct</span>
-              <div class="arrow-btn">→</div>
-            </div>
-          </div>
-
         </div>
-      </section>
+      </div>
 
-      <!-- CONVERSATION DRAWER (APPEARS ON QUERY) -->
+      <!-- CONVERSATION DRAWER (STREAMING) -->
       <section class="chat-drawer" id="chatDrawer">
         <div class="drawer-top">
           <div class="drawer-title">
             <span style="color: #818cf8;">💬</span> Active OmniPlus Conversation
           </div>
-          <button class="close-btn" onclick="toggleDrawer(false)" title="Minimize conversation">✕</button>
+          <div class="drawer-controls">
+            <button class="mini-btn" onclick="exportConversation()">📥 Export .md</button>
+            <button class="close-btn" onclick="toggleDrawer(false)" title="Minimize conversation">✕</button>
+          </div>
         </div>
         <div class="msg-group" id="msgGroup"></div>
       </section>
 
-      <!-- BOTTOM FLOATING CHAT INPUT BAR -->
+      <!-- BOTTOM FLOATING CHAT INPUT BAR WITH SPEECH MIC -->
       <div class="chat-input-bar">
         <span class="chat-sparkle">✨</span>
         <input type="text" id="mainInput" placeholder="Ask OmniPlus or prompt a tool action... (Press Enter)" autofocus />
+        <button class="mic-btn" id="micBtn" onclick="toggleSpeechRecognition()" title="Voice input (Speech to Text)">🎙️</button>
         <button class="send-pill-btn" id="sendBtn" onclick="submitMessage()">
           <span>Send</span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -1346,7 +1578,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
         <p class="panel-desc">Jump into what you need</p>
 
-        <div class="action-row" onclick="quickPrompt('Search the web for the latest updates on Python and MCP.')">
+        <div class="action-row" onclick="switchView('search')">
           <div class="action-left">
             <div class="action-icon" style="color: #38bdf8;">🌐</div>
             <div class="action-meta">
@@ -1357,7 +1589,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <span class="chevron-right">›</span>
         </div>
 
-        <div class="action-row" onclick="quickPrompt('Browse project directory files and summarize main modules.')">
+        <div class="action-row" onclick="switchView('files')">
           <div class="action-left">
             <div class="action-icon" style="color: #f59e0b;">📁</div>
             <div class="action-meta">
@@ -1368,7 +1600,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <span class="chevron-right">›</span>
         </div>
 
-        <div class="action-row" onclick="quickPrompt('Check GitHub repository status and repository files.')">
+        <div class="action-row" onclick="switchView('github')">
           <div class="action-left">
             <div class="action-icon" style="color: #c084fc;">🐙</div>
             <div class="action-meta">
@@ -1379,7 +1611,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <span class="chevron-right">›</span>
         </div>
 
-        <div class="action-row" onclick="quickPrompt('Run loaded MCP tools and show output.')">
+        <div class="action-row" onclick="switchView('tools')">
           <div class="action-left">
             <div class="action-icon" style="color: #2dd4bf;">🔧</div>
             <div class="action-meta">
@@ -1397,7 +1629,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <h4 class="panel-title">
             <span style="color: #38bdf8;">🕒</span> Recent Activity
           </h4>
-          <span class="panel-link" onclick="quickPrompt('Summarize recent interactions and tool executions.')">View all</span>
+          <span class="panel-link" onclick="quickPrompt('Summarize recent interactions and tool executions.')" style="color: #6366f1; font-size: 0.72rem; cursor: pointer;">View all</span>
         </div>
 
         <div class="activity-list" id="activityList">
@@ -1468,50 +1700,56 @@ HTML_CONTENT = """<!DOCTYPE html>
     const chatDrawer = document.getElementById('chatDrawer');
     const msgGroup = document.getElementById('msgGroup');
     const activityList = document.getElementById('activityList');
+    const micBtn = document.getElementById('micBtn');
 
-    // Time-based greeting (morning/afternoon/evening)
+    let chatHistoryLog = [];
+    let currentSelectedFilePath = '';
+
+    // Greeting calculation
     (function setGreeting() {
       const hour = new Date().getHours();
-      const greetingEl = document.getElementById('timeGreeting');
-      if (hour >= 5 && hour < 12) greetingEl.textContent = 'morning';
-      else if (hour >= 12 && hour < 17) greetingEl.textContent = 'afternoon';
-      else greetingEl.textContent = 'evening';
+      const el = document.getElementById('timeGreeting');
+      if (hour >= 5 && hour < 12) el.textContent = 'morning';
+      else if (hour >= 12 && hour < 17) el.textContent = 'afternoon';
+      else el.textContent = 'evening';
     })();
+
+    // View Switching
+    function switchView(viewName) {
+      document.querySelectorAll('.view-container').forEach(el => el.classList.remove('active-view'));
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+
+      const targetView = document.getElementById(`view-${viewName}`);
+      const targetNav = document.getElementById(`nav-${viewName}`);
+
+      if (targetView) targetView.classList.add('active-view');
+      if (targetNav) targetNav.classList.add('active');
+
+      if (viewName === 'files') refreshFileTree();
+      else if (viewName === 'tools') loadDetailedTools();
+      else if (viewName === 'settings') loadSettingsInfo();
+    }
 
     mainInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') submitMessage();
     });
 
+    document.getElementById('webSearchInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') executeWebSearch();
+    });
+
     function quickPrompt(text) {
+      switchView('home');
       mainInput.value = text;
       submitMessage();
     }
 
     function toggleDrawer(show) {
-      if (show) {
-        chatDrawer.classList.add('open');
-      } else {
-        chatDrawer.classList.remove('open');
-      }
+      if (show) chatDrawer.classList.add('open');
+      else chatDrawer.classList.remove('open');
     }
 
-    function selectNav(el, section) {
-      document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('active'));
-      el.classList.add('active');
-
-      if (section === 'files') {
-        quickPrompt('List and summarize all directories and key files in this project workspace.');
-      } else if (section === 'search') {
-        quickPrompt('Perform a search for the latest documentation on Model Context Protocol.');
-      } else if (section === 'github') {
-        quickPrompt('Inspect the GitHub integration status and repository configuration.');
-      } else if (section === 'tools') {
-        quickPrompt('List all active MCP tools and demonstrate how each tool functions.');
-      } else if (section === 'settings') {
-        quickPrompt('Show the current OmniPlus system configuration, active Gemini model, and server status.');
-      }
-    }
-
+    // REAL-TIME TOKEN STREAMING (SSE)
     async function submitMessage() {
       const text = mainInput.value.trim();
       if (!text) return;
@@ -1521,35 +1759,73 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       // Append user message
       appendMessage('user', text);
+      chatHistoryLog.push({ role: 'user', content: text });
+
       sendBtn.disabled = true;
-      sendBtn.innerHTML = '<span class="spinner"></span> Thinking...';
+      sendBtn.innerHTML = '<span class="spinner"></span> Streaming...';
 
-      // Append thinking indicator
-      const assistantMsg = appendMessage('assistant', '<span class="spinner"></span> <i>OmniPlus is reasoning & executing MCP tools...</i>');
-      chatDrawer.scrollTop = chatDrawer.scrollHeight;
+      // Create assistant container
+      const assistantMsg = appendMessage('assistant', '<div class="tool-status-container"></div><div class="stream-text"></div>');
+      const streamTextEl = assistantMsg.querySelector('.stream-text');
+      const toolStatusEl = assistantMsg.querySelector('.tool-status-container');
 
-      // Add to recent activity
       logRecentActivity(text);
 
+      let accumulatedText = '';
+
       try {
-        const res = await fetch('/api/chat', {
+        const response = await fetch('/api/chat/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: text })
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.detail || 'Failed to get response');
+
+        if (!response.ok) {
+          throw new Error(`HTTP Error: ${response.status}`);
         }
-        assistantMsg.querySelector('.msg-bubble').innerHTML = marked.parse(data.response);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const jsonStr = line.slice(6).trim();
+              if (!jsonStr) continue;
+              try {
+                const data = JSON.parse(jsonStr);
+                if (data.type === 'token') {
+                  accumulatedText += data.text;
+                  streamTextEl.innerHTML = marked.parse(accumulatedText);
+                  enhanceCodeBlocks(streamTextEl);
+                } else if (data.type === 'tool_start') {
+                  toolStatusEl.innerHTML = `<span class="tool-badge-pill">🔧 Executing: <b>${data.tool}</b>...</span>`;
+                } else if (data.type === 'tool_end') {
+                  toolStatusEl.innerHTML = `<span class="tool-badge-pill" style="border-color: rgba(16,185,129,0.4); color: #34d399;">✓ Tool complete: <b>${data.tool}</b></span>`;
+                } else if (data.type === 'error') {
+                  toolStatusEl.innerHTML = '';
+                  streamTextEl.innerHTML = `<p style="color: #fbbf24;">⚠️ ${data.message}</p>`;
+                }
+              } catch (e) {
+                // Ignore parse errors on chunk boundary
+              }
+            }
+          }
+          chatDrawer.scrollTop = chatDrawer.scrollHeight;
+        }
+
+        chatHistoryLog.push({ role: 'assistant', content: accumulatedText });
+
       } catch (err) {
-        let msgText = err.message;
-        if (msgText.includes('429') || msgText.includes('RESOURCE_EXHAUSTED') || msgText.includes('quota')) {
-          msgText = '⏳ <b>Google AI Studio Free Tier rate limit reached.</b><br><br>The free tier allows 5 requests per minute. OmniPlus retried automatically, but the quota window is still active. Please wait <b>10 seconds</b> and try again!';
-          assistantMsg.querySelector('.msg-bubble').innerHTML = `<div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); padding: 0.85rem; border-radius: 10px; color: #fde68a; font-size: 0.88rem; line-height: 1.5;">${msgText}</div>`;
-        } else {
-          assistantMsg.querySelector('.msg-bubble').innerHTML = `<p style="color: #f87171;">⚠️ <b>Error:</b> ${msgText}</p>`;
-        }
+        streamTextEl.innerHTML = `<p style="color: #f87171;">⚠️ <b>Connection error:</b> ${err.message}</p>`;
       } finally {
         sendBtn.disabled = false;
         sendBtn.innerHTML = `<span>Send</span> <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
@@ -1563,12 +1839,99 @@ HTML_CONTENT = """<!DOCTYPE html>
       msg.className = `msg ${role}`;
       msg.innerHTML = `
         <div class="msg-avatar">${role === 'user' ? '👤' : '🤖'}</div>
-        <div class="msg-bubble">${htmlContent.startsWith('<') ? htmlContent : `<p>${htmlContent}</p>`}</div>
+        <div class="msg-bubble">${htmlContent}</div>
       `;
       msgGroup.appendChild(msg);
+      chatDrawer.scrollTop = chatDrawer.scrollHeight;
       return msg;
     }
 
+    // CODE BLOCK SYNTAX HIGHLIGHTING & COPY BUTTON
+    function enhanceCodeBlocks(container) {
+      container.querySelectorAll('pre code').forEach((block) => {
+        if (!block.dataset.highlighted) {
+          hljs.highlightElement(block);
+          block.dataset.highlighted = 'true';
+
+          const pre = block.parentElement;
+          if (!pre.parentElement.classList.contains('code-container')) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'code-container';
+            pre.parentNode.insertBefore(wrapper, pre);
+            wrapper.appendChild(pre);
+
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'code-copy-btn';
+            copyBtn.textContent = 'Copy';
+            copyBtn.onclick = () => {
+              navigator.clipboard.writeText(block.innerText);
+              copyBtn.textContent = 'Copied!';
+              setTimeout(() => copyBtn.textContent = 'Copy', 1800);
+            };
+            wrapper.appendChild(copyBtn);
+          }
+        }
+      });
+    }
+
+    // WEB SPEECH RECOGNITION (VOICE INPUT)
+    let recognition = null;
+    let isListening = false;
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        mainInput.value = transcript;
+        stopSpeech();
+      };
+      recognition.onerror = () => stopSpeech();
+      recognition.onend = () => stopSpeech();
+    }
+
+    function toggleSpeechRecognition() {
+      if (!recognition) {
+        alert('Speech recognition is not supported in this browser. Try Chrome or Edge.');
+        return;
+      }
+      if (isListening) stopSpeech();
+      else startSpeech();
+    }
+
+    function startSpeech() {
+      isListening = true;
+      micBtn.classList.add('listening');
+      recognition.start();
+    }
+
+    function stopSpeech() {
+      isListening = false;
+      micBtn.classList.remove('listening');
+      try { recognition.stop(); } catch (e) {}
+    }
+
+    // EXPORT CONVERSATION
+    function exportConversation() {
+      if (!chatHistoryLog.length) {
+        alert('No conversation to export yet.');
+        return;
+      }
+      let md = `# OmniPlus Conversation Export\\n*Exported on ${new Date().toLocaleString()}*\\n\\n---\\n\\n`;
+      chatHistoryLog.forEach(m => {
+        md += `### ${m.role === 'user' ? '👤 User' : '🤖 OmniPlus'}:\\n\\n${m.content}\\n\\n---\\n\\n`;
+      });
+      const blob = new Blob([md], { type: 'text/markdown' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `omniplus-chat-${Date.now()}.md`;
+      a.click();
+    }
+
+    // RECENT ACTIVITY LOGGER
     function logRecentActivity(query) {
       let icon = '✨';
       let iconClass = 'icon-purple';
@@ -1600,9 +1963,166 @@ HTML_CONTENT = """<!DOCTYPE html>
       }
     }
 
+    // FILE TREE EXPLORER
+    async function refreshFileTree() {
+      const pane = document.getElementById('fileTreePane');
+      pane.innerHTML = '<p style="color: var(--text-dim); font-size: 0.8rem;">Loading tree...</p>';
+      try {
+        const res = await fetch('/api/files/tree');
+        const data = await res.json();
+        pane.innerHTML = renderTreeNodes(data.tree);
+      } catch (e) {
+        pane.innerHTML = `<p style="color: #f87171;">Failed to load files: ${e.message}</p>`;
+      }
+    }
+
+    function renderTreeNodes(nodes, level = 0) {
+      let html = '';
+      nodes.forEach(node => {
+        const indent = level * 14;
+        if (node.type === 'dir') {
+          html += `
+            <div class="tree-item" style="padding-left: ${indent}px; font-weight: 700; color: #cbd5e1;">
+              <span>📁</span> ${node.name}
+            </div>
+          `;
+          if (node.children && node.children.length) {
+            html += renderTreeNodes(node.children, level + 1);
+          }
+        } else {
+          html += `
+            <div class="tree-item" style="padding-left: ${indent}px;" onclick="loadFileContent('${node.path}', this)">
+              <span>📄</span> ${node.name}
+            </div>
+          `;
+        }
+      });
+      return html;
+    }
+
+    async function loadFileContent(filePath, el) {
+      document.querySelectorAll('.tree-item').forEach(i => i.classList.remove('selected'));
+      if (el) el.classList.add('selected');
+
+      currentSelectedFilePath = filePath;
+      document.getElementById('selectedFileName').textContent = filePath;
+      const pre = document.getElementById('fileContentPre');
+      pre.textContent = 'Loading...';
+
+      try {
+        const res = await fetch(`/api/files/content?path=${encodeURIComponent(filePath)}`);
+        const data = await res.json();
+        pre.textContent = data.content;
+      } catch (e) {
+        pre.textContent = `Error reading file: ${e.message}`;
+      }
+    }
+
+    function askAiAboutFile() {
+      if (!currentSelectedFilePath) {
+        alert('Please select a file first.');
+        return;
+      }
+      quickPrompt(`Analyze and explain the contents of file: ${currentSelectedFilePath}`);
+    }
+
+    function copyCurrentFile() {
+      const text = document.getElementById('fileContentPre').textContent;
+      navigator.clipboard.writeText(text);
+      alert('File content copied to clipboard!');
+    }
+
+    // LIVE WEB SEARCH TAB
+    async function executeWebSearch() {
+      const q = document.getElementById('webSearchInput').value.trim();
+      if (!q) return;
+
+      const grid = document.getElementById('searchResultsGrid');
+      grid.innerHTML = '<p style="color: var(--text-dim);">Searching DuckDuckGo via MCP...</p>';
+
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+        const data = await res.json();
+        if (!data.results || !data.results.length) {
+          grid.innerHTML = '<p style="color: var(--text-dim);">No results found.</p>';
+          return;
+        }
+        grid.innerHTML = data.results.map(r => `
+          <div class="search-card">
+            <h4>${r.title}</h4>
+            <a href="${r.href}" target="_blank">${r.href}</a>
+            <p>${r.body}</p>
+            <button class="mini-btn" style="margin-top: 0.6rem;" onclick="quickPrompt('Summarize information from: ${r.title} (${r.href})')">
+              ✨ Summarize with Gemini
+            </button>
+          </div>
+        `).join('');
+      } catch (e) {
+        grid.innerHTML = `<p style="color: #f87171;">Search error: ${e.message}</p>`;
+      }
+    }
+
+    // TOOLS DETAILS TAB
+    async function loadDetailedTools() {
+      const grid = document.getElementById('toolsDetailedGrid');
+      grid.innerHTML = '<p style="color: var(--text-dim);">Inspecting MCP servers...</p>';
+
+      try {
+        const res = await fetch('/api/tools/detailed');
+        const data = await res.json();
+        if (!data.tools || !data.tools.length) {
+          grid.innerHTML = '<p style="color: var(--text-dim);">No tools loaded.</p>';
+          return;
+        }
+        grid.innerHTML = data.tools.map(t => `
+          <div class="tool-box-card">
+            <div>
+              <h4>${t.name}</h4>
+              <p>${t.description}</p>
+            </div>
+            <button class="send-pill-btn" style="padding: 0.35rem 0.8rem; font-size: 0.75rem; align-self: flex-start;" onclick="quickPrompt('Demonstrate the MCP tool: ${t.name}')">
+              Test Tool ⚡
+            </button>
+          </div>
+        `).join('');
+      } catch (e) {
+        grid.innerHTML = `<p style="color: #f87171;">Error: ${e.message}</p>`;
+      }
+    }
+
+    // SETTINGS MANAGER
+    async function loadSettingsInfo() {
+      try {
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        if (data.model) {
+          document.getElementById('settingModelSelect').value = data.model;
+        }
+      } catch (e) {}
+    }
+
+    async function saveSystemSettings() {
+      const model = document.getElementById('settingModelSelect').value;
+      const apiKey = document.getElementById('settingApiKeyInput').value;
+
+      try {
+        const res = await fetch('/api/settings/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, api_key: apiKey })
+        });
+        const data = await res.json();
+        document.getElementById('navModelStatus').textContent = `Ready • ${data.model}`;
+        alert(`Settings saved! Active model is now: ${data.model}`);
+      } catch (e) {
+        alert(`Failed to save settings: ${e.message}`);
+      }
+    }
+
     async function clearAllChat() {
       await fetch('/api/clear', { method: 'POST' });
       msgGroup.innerHTML = '';
+      chatHistoryLog = [];
       toggleDrawer(false);
     }
   </script>

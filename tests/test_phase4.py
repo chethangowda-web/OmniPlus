@@ -3,6 +3,8 @@ import subprocess
 import sys
 
 PYTHON = sys.executable
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 
 def test_github_server_config():
