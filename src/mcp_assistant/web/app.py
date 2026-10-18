@@ -52,16 +52,54 @@ class ChatResponse(BaseModel):
 
 
 class SettingsUpdateRequest(BaseModel):
+    provider: str | None = None
+    groq_model: str | None = None
+    groq_api_key: str | None = None
+    gemini_model: str | None = None
+    gemini_api_key: str | None = None
     model: str | None = None
     api_key: str | None = None
 
 
+def _update_env_file(key_values: dict[str, str]) -> None:
+    """Safely persist updated configuration keys to the local .env file."""
+    env_path = Path(".env")
+    lines: list[str] = []
+    existing_keys: set[str] = set()
+
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            line_s = line.strip()
+            if "=" in line_s and not line_s.startswith("#"):
+                k, _ = line_s.split("=", 1)
+                k = k.strip()
+                if k in key_values:
+                    lines[i] = f"{k}={key_values[k]}"
+                    existing_keys.add(k)
+
+    for k, v in key_values.items():
+        if k not in existing_keys and v:
+            lines.append(f"{k}={v}")
+
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 @app.get("/api/health")
 async def health():
+    try:
+        settings = get_settings()
+        prov = settings.get_active_provider()
+        model = settings.groq_model if prov == "groq" else settings.gemini_model
+    except Exception:
+        prov = "groq"
+        model = "llama-3.3-70b-versatile"
     return {
         "status": "ok",
         "app": "OmniPlus",
-        "version": "0.2.0",
+        "version": "0.3.0",
+        "provider": prov,
+        "model": model,
         "python": os.sys.version.split()[0],
     }
 
@@ -71,29 +109,91 @@ async def get_config_info():
     try:
         settings = get_settings()
         servers = build_mcp_config(settings)
+        active_prov = settings.get_active_provider()
         return {
-            "model": settings.gemini_model,
+            "provider": active_prov,
+            "groq_model": settings.groq_model,
+            "has_groq": settings.has_groq(),
+            "gemini_model": settings.gemini_model,
+            "has_gemini": settings.has_gemini(),
             "has_github": settings.has_github(),
             "enabled_servers": list(servers.keys()),
-            "api_key_masked": f"{settings.gemini_api_key[:6]}...{settings.gemini_api_key[-4:]}" if len(settings.gemini_api_key) > 10 else "****",
+            "groq_key_masked": (
+                f"{settings.groq_api_key[:6]}...{settings.groq_api_key[-4:]}"
+                if settings.has_groq() and len(settings.groq_api_key or "") > 10
+                else ("Configured" if settings.has_groq() else "Not set")
+            ),
+            "gemini_key_masked": (
+                f"{settings.gemini_api_key[:6]}...{settings.gemini_api_key[-4:]}"
+                if settings.has_gemini() and len(settings.gemini_api_key) > 10
+                else ("Configured" if settings.has_gemini() else "Not set")
+            ),
+            "model": settings.groq_model if active_prov == "groq" else settings.gemini_model,
         }
     except Exception as e:
-        return {"error": str(e), "model": "gemini-3.5-flash", "enabled_servers": ["filesystem", "websearch"]}
+        return {
+            "error": str(e),
+            "provider": "groq",
+            "model": "llama-3.3-70b-versatile",
+            "has_groq": False,
+            "has_gemini": False,
+            "enabled_servers": ["filesystem", "websearch"],
+        }
 
 
 @app.post("/api/settings/update")
 async def update_settings(req: SettingsUpdateRequest):
     global _assistant_instance
+    updates: dict[str, str] = {}
+
+    if req.provider:
+        p = req.provider.strip().lower()
+        updates["LLM_PROVIDER"] = p
+        os.environ["LLM_PROVIDER"] = p
+    if req.groq_model:
+        updates["GROQ_MODEL"] = req.groq_model.strip()
+        os.environ["GROQ_MODEL"] = req.groq_model.strip()
+    if req.groq_api_key and req.groq_api_key.strip():
+        updates["GROQ_API_KEY"] = req.groq_api_key.strip()
+        os.environ["GROQ_API_KEY"] = req.groq_api_key.strip()
+    if req.gemini_model:
+        updates["GEMINI_MODEL"] = req.gemini_model.strip()
+        os.environ["GEMINI_MODEL"] = req.gemini_model.strip()
+    if req.gemini_api_key and req.gemini_api_key.strip():
+        updates["GEMINI_API_KEY"] = req.gemini_api_key.strip()
+        os.environ["GEMINI_API_KEY"] = req.gemini_api_key.strip()
+
+    # Backwards compatibility
     if req.model:
-        os.environ["GEMINI_MODEL"] = req.model.strip()
+        if "gemini" in req.model.lower():
+            updates["GEMINI_MODEL"] = req.model.strip()
+            os.environ["GEMINI_MODEL"] = req.model.strip()
+        else:
+            updates["GROQ_MODEL"] = req.model.strip()
+            os.environ["GROQ_MODEL"] = req.model.strip()
     if req.api_key and req.api_key.strip():
-        os.environ["GEMINI_API_KEY"] = req.api_key.strip()
+        if req.api_key.strip().startswith("gsk_"):
+            updates["GROQ_API_KEY"] = req.api_key.strip()
+            os.environ["GROQ_API_KEY"] = req.api_key.strip()
+        else:
+            updates["GEMINI_API_KEY"] = req.api_key.strip()
+            os.environ["GEMINI_API_KEY"] = req.api_key.strip()
+
+    if updates:
+        _update_env_file(updates)
 
     get_settings.cache_clear()
     settings = get_settings()
     _assistant_instance = MCPAssistant(settings)
     await _assistant_instance.setup()
-    return {"status": "updated", "model": settings.gemini_model}
+
+    return {
+        "status": "updated",
+        "provider": _assistant_instance.provider,
+        "model": _assistant_instance.current_model,
+        "has_groq": settings.has_groq(),
+        "has_gemini": settings.has_gemini(),
+    }
 
 
 @app.get("/api/tools")
@@ -1503,33 +1603,97 @@ HTML_CONTENT = """<!DOCTYPE html>
       <div class="view-container" id="view-settings">
         <div class="view-card">
           <div class="view-header">
-            <h3 class="view-title"><span>⚙️</span> System Settings & Quota Manager</h3>
+            <h3 class="view-title"><span>⚙️</span> AI Provider & System Settings</h3>
           </div>
           <div class="settings-form">
+            <!-- Provider Selection -->
             <div class="form-group">
-              <label class="form-label">Active Gemini Model</label>
-              <select class="form-input" id="settingModelSelect">
-                <option value="gemini-3.5-flash">gemini-3.5-flash (Fast & Fresh Quota — Recommended)</option>
-                <option value="gemini-flash-latest">gemini-flash-latest</option>
-                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (High RPM)</option>
-                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
-                <option value="gemma-4-31b-it">gemma-4-31b-it</option>
-              </select>
+              <label class="form-label" style="font-weight: 700; color: #fff;">Choose Active AI Provider</label>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-top: 0.4rem;">
+                <div id="providerOptionGroq" class="provider-select-box active" onclick="setUiProvider('groq')" style="cursor: pointer; padding: 1rem; border: 1.5px solid #6366f1; border-radius: 12px; background: rgba(99, 102, 241, 0.12); transition: all 0.2s ease;">
+                  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.35rem;">
+                    <span style="font-weight: 700; color: #fff; font-size: 0.95rem;">⚡ Groq Cloud (Recommended)</span>
+                    <span class="badge-pill" style="background: rgba(34, 197, 94, 0.2); color: #4ade80;">14.4k Req/Day</span>
+                  </div>
+                  <p style="color: var(--text-dim); font-size: 0.77rem; margin: 0; line-height: 1.45;">
+                    Ultra-fast LPU inference, 30 RPM, no daily lockouts. Recommended for uninterrupted pairs.
+                  </p>
+                </div>
+                <div id="providerOptionGemini" class="provider-select-box" onclick="setUiProvider('gemini')" style="cursor: pointer; padding: 1rem; border: 1px solid var(--border); border-radius: 12px; background: rgba(255, 255, 255, 0.02); transition: all 0.2s ease;">
+                  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.35rem;">
+                    <span style="font-weight: 700; color: #fff; font-size: 0.95rem;">✨ Google Gemini</span>
+                    <span class="badge-pill" style="background: rgba(239, 68, 68, 0.2); color: #f87171;">20 Req/Day</span>
+                  </div>
+                  <p style="color: var(--text-dim); font-size: 0.77rem; margin: 0; line-height: 1.45;">
+                    Standard Google AI Studio models (Free tier capped at 20 requests per day).
+                  </p>
+                </div>
+              </div>
             </div>
 
-            <div class="form-group">
-              <label class="form-label">Google Gemini API Key</label>
-              <input type="password" class="form-input" id="settingApiKeyInput" placeholder="Update Gemini API Key..." />
-              <span style="font-size: 0.72rem; color: var(--text-dim);">Keys are securely stored in your local .env file.</span>
+            <!-- Groq Settings Panel -->
+            <div id="groqSettingsBlock" style="margin-top: 0.5rem;">
+              <div class="form-group">
+                <label class="form-label">Groq Model</label>
+                <select class="form-input" id="settingGroqModelSelect">
+                  <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (Best Reasoning, 128k context — Recommended)</option>
+                  <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (Fastest ~800 tokens/sec)</option>
+                  <option value="mixtral-8x7b-32768">mixtral-8x7b-32768 (32k context MoE)</option>
+                  <option value="gemma2-9b-it">gemma2-9b-it (Google Gemma 2 on Groq)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                  <label class="form-label" style="margin: 0;">Groq API Key</label>
+                  <span id="groqKeyStatusBadge" style="font-size: 0.73rem; color: #f87171; font-weight: 600;">Not configured</span>
+                </div>
+                <input type="password" class="form-input" id="settingGroqApiKeyInput" placeholder="Enter your Groq key (gsk_...)" />
+                <div style="display: flex; justify-content: space-between; margin-top: 0.4rem; font-size: 0.74rem;">
+                  <span style="color: var(--text-dim);">Keys are securely saved in your local git-ignored .env file.</span>
+                  <a href="https://console.groq.com/keys" target="_blank" style="color: #818cf8; text-decoration: underline; font-weight: 600;">👉 Get Free Groq Key (Takes 10s)</a>
+                </div>
+              </div>
             </div>
 
-            <button class="send-pill-btn" onclick="saveSystemSettings()" style="align-self: flex-start;">Save Configuration</button>
+            <!-- Gemini Settings Panel -->
+            <div id="geminiSettingsBlock" style="margin-top: 0.5rem; display: none;">
+              <div class="form-group">
+                <label class="form-label">Gemini Model</label>
+                <select class="form-input" id="settingGeminiModelSelect">
+                  <option value="gemini-3.5-flash">gemini-3.5-flash (Fast & Fresh Quota)</option>
+                  <option value="gemini-flash-latest">gemini-flash-latest</option>
+                  <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (High RPM)</option>
+                  <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                  <option value="gemma-4-31b-it">gemma-4-31b-it</option>
+                </select>
+              </div>
 
-            <div style="margin-top: 1rem; padding: 1rem; background: #090c16; border: 1px solid var(--border); border-radius: 12px;">
-              <h5 style="color: #fff; font-size: 0.85rem; margin-bottom: 0.5rem;">Automated Failover Pool</h5>
-              <p style="color: var(--text-muted); font-size: 0.78rem; line-height: 1.5;">
-                If your primary model ever encounters Google's free-tier rate limit (429), OmniPlus will automatically hop through:
-                <code style="color: #a5b4fc;">gemini-3.5-flash ➔ gemini-flash-latest ➔ gemini-3.5-flash-lite ➔ gemini-3.1-flash-lite</code>
+              <div class="form-group">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                  <label class="form-label" style="margin: 0;">Google Gemini API Key</label>
+                  <span id="geminiKeyStatusBadge" style="font-size: 0.73rem; color: #4ade80; font-weight: 600;">Configured</span>
+                </div>
+                <input type="password" class="form-input" id="settingGeminiApiKeyInput" placeholder="Update Gemini API Key..." />
+                <div style="display: flex; justify-content: space-between; margin-top: 0.4rem; font-size: 0.74rem;">
+                  <span style="color: var(--text-dim);">Google AI Studio Key</span>
+                  <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color: #818cf8; text-decoration: underline;">Get Gemini Key</a>
+                </div>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 0.8rem; margin-top: 0.8rem;">
+              <button class="send-pill-btn" onclick="saveSystemSettings()" style="padding: 0.65rem 1.6rem; font-size: 0.88rem;">
+                💾 Save Configuration
+              </button>
+            </div>
+
+            <div style="margin-top: 1.25rem; padding: 1.1rem; background: #090c16; border: 1px solid var(--border); border-radius: 12px;">
+              <h5 style="color: #fff; font-size: 0.86rem; margin-bottom: 0.4rem; display: flex; align-items: center; gap: 0.4rem;">
+                🛡️ Automated Resilience & Zero-Downtime Failover
+              </h5>
+              <p style="color: var(--text-muted); font-size: 0.78rem; line-height: 1.55; margin: 0;">
+                If your active model runs into rate limits or quota exhaustion, OmniPlus automatically cascades through the fallback models and cross-fails over between Groq and Gemini to ensure continuous assistant availability!
               </p>
             </div>
           </div>
@@ -1812,7 +1976,18 @@ HTML_CONTENT = """<!DOCTYPE html>
                   toolStatusEl.innerHTML = `<span class="tool-badge-pill" style="border-color: rgba(16,185,129,0.4); color: #34d399;">✓ Tool complete: <b>${data.tool}</b></span>`;
                 } else if (data.type === 'error') {
                   toolStatusEl.innerHTML = '';
-                  streamTextEl.innerHTML = `<p style="color: #fbbf24;">⚠️ ${data.message}</p>`;
+                  let msg = data.message;
+                  let actionHtml = '';
+                  if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Groq API Key Required') || msg.includes('Groq')) {
+                    actionHtml = `
+                      <div style="margin-top: 0.8rem;">
+                        <button class="send-pill-btn" onclick="switchView('settings')" style="padding: 0.45rem 1.1rem; font-size: 0.8rem;">
+                          ⚙️ Open Settings to Add Groq Key
+                        </button>
+                      </div>
+                    `;
+                  }
+                  streamTextEl.innerHTML = `<div style="padding: 0.5rem 0; color: #fbbf24;">⚠️ ${msg}${actionHtml}</div>`;
                 }
               } catch (e) {
                 // Ignore parse errors on chunk boundary
@@ -2091,29 +2266,109 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     // SETTINGS MANAGER
+    let selectedProvider = 'groq';
+
+    function setUiProvider(p) {
+      selectedProvider = p;
+      const groqBox = document.getElementById('providerOptionGroq');
+      const geminiBox = document.getElementById('providerOptionGemini');
+      const groqBlock = document.getElementById('groqSettingsBlock');
+      const geminiBlock = document.getElementById('geminiSettingsBlock');
+
+      if (!groqBox || !geminiBox || !groqBlock || !geminiBlock) return;
+
+      if (p === 'groq') {
+        groqBox.style.borderColor = '#6366f1';
+        groqBox.style.background = 'rgba(99, 102, 241, 0.12)';
+        geminiBox.style.borderColor = 'var(--border)';
+        geminiBox.style.background = 'rgba(255, 255, 255, 0.02)';
+        groqBlock.style.display = 'block';
+        geminiBlock.style.display = 'none';
+      } else {
+        geminiBox.style.borderColor = '#6366f1';
+        geminiBox.style.background = 'rgba(99, 102, 241, 0.12)';
+        groqBox.style.borderColor = 'var(--border)';
+        groqBox.style.background = 'rgba(255, 255, 255, 0.02)';
+        groqBlock.style.display = 'none';
+        geminiBlock.style.display = 'block';
+      }
+    }
+
     async function loadSettingsInfo() {
       try {
         const res = await fetch('/api/config');
         const data = await res.json();
-        if (data.model) {
-          document.getElementById('settingModelSelect').value = data.model;
+
+        selectedProvider = data.provider || 'groq';
+        setUiProvider(selectedProvider);
+
+        if (data.groq_model && document.getElementById('settingGroqModelSelect')) {
+          document.getElementById('settingGroqModelSelect').value = data.groq_model;
         }
-      } catch (e) {}
+        if (data.gemini_model && document.getElementById('settingGeminiModelSelect')) {
+          document.getElementById('settingGeminiModelSelect').value = data.gemini_model;
+        }
+
+        const groqBadge = document.getElementById('groqKeyStatusBadge');
+        if (groqBadge) {
+          if (data.has_groq) {
+            groqBadge.textContent = `Configured (${data.groq_key_masked})`;
+            groqBadge.style.color = '#4ade80';
+          } else {
+            groqBadge.textContent = '❌ Key Missing (Add below)';
+            groqBadge.style.color = '#f87171';
+          }
+        }
+
+        const geminiBadge = document.getElementById('geminiKeyStatusBadge');
+        if (geminiBadge) {
+          if (data.has_gemini) {
+            geminiBadge.textContent = `Configured (${data.gemini_key_masked})`;
+            geminiBadge.style.color = '#4ade80';
+          } else {
+            geminiBadge.textContent = 'Not configured';
+            geminiBadge.style.color = 'var(--text-dim)';
+          }
+        }
+
+        const provLabel = selectedProvider === 'groq' ? '⚡ Groq' : '✨ Gemini';
+        const activeModel = selectedProvider === 'groq' ? (data.groq_model || 'llama-3.3-70b-versatile') : (data.gemini_model || 'gemini-3.5-flash');
+        const navStatus = document.getElementById('navModelStatus');
+        if (navStatus) {
+          navStatus.textContent = `Ready • ${provLabel} (${activeModel})`;
+        }
+      } catch (e) {
+        console.error('Error loading config:', e);
+      }
     }
 
     async function saveSystemSettings() {
-      const model = document.getElementById('settingModelSelect').value;
-      const apiKey = document.getElementById('settingApiKeyInput').value;
+      const groqModel = document.getElementById('settingGroqModelSelect')?.value;
+      const groqApiKey = document.getElementById('settingGroqApiKeyInput')?.value;
+      const geminiModel = document.getElementById('settingGeminiModelSelect')?.value;
+      const geminiApiKey = document.getElementById('settingGeminiApiKeyInput')?.value;
 
       try {
         const res = await fetch('/api/settings/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model, api_key: apiKey })
+          body: JSON.stringify({
+            provider: selectedProvider,
+            groq_model: groqModel,
+            groq_api_key: groqApiKey,
+            gemini_model: geminiModel,
+            gemini_api_key: geminiApiKey,
+          })
         });
         const data = await res.json();
-        document.getElementById('navModelStatus').textContent = `Ready • ${data.model}`;
-        alert(`Settings saved! Active model is now: ${data.model}`);
+        if (data.status === 'updated') {
+          const provLabel = data.provider === 'groq' ? '⚡ Groq' : '✨ Gemini';
+          document.getElementById('navModelStatus').textContent = `Ready • ${provLabel} (${data.model})`;
+          alert(`✅ Configuration updated successfully!\nActive Provider: ${data.provider.toUpperCase()}\nModel: ${data.model}`);
+          loadSettingsInfo();
+        } else {
+          alert(`Notice: ${JSON.stringify(data)}`);
+        }
       } catch (e) {
         alert(`Failed to save settings: ${e.message}`);
       }

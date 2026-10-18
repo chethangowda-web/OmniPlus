@@ -52,7 +52,14 @@ class MCPAssistant:
         settings: Application settings containing API keys and configuration.
     """
 
-_FALLBACK_MODELS = [
+_GROQ_FALLBACK_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
+_GEMINI_FALLBACK_MODELS = [
     "gemini-3.5-flash",
     "gemini-flash-latest",
     "gemini-3.5-flash-lite",
@@ -63,10 +70,10 @@ _FALLBACK_MODELS = [
 
 
 class MCPAssistant:
-    """LangChain ReAct agent backed by Google Gemini and MCP tools.
+    """LangChain ReAct agent backed by Groq / Google Gemini and MCP tools.
 
-    Features intelligent automated model failover across Google AI Studio models
-    to seamlessly handle free-tier rate limits and daily quotas.
+    Features intelligent automated model & provider failover across Groq LPUs
+    and Google AI Studio models to seamlessly handle rate limits and daily quotas.
 
     Args:
         settings: Application settings containing API keys and configuration.
@@ -74,9 +81,15 @@ class MCPAssistant:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        # Build priority model list with user's configured model first
-        user_model = settings.gemini_model
-        self._model_pool = [user_model] + [m for m in _FALLBACK_MODELS if m != user_model]
+        self._provider = settings.get_active_provider()
+
+        if self._provider == "groq":
+            user_model = settings.groq_model or "llama-3.3-70b-versatile"
+            self._model_pool = [user_model] + [m for m in _GROQ_FALLBACK_MODELS if m != user_model]
+        else:
+            user_model = settings.gemini_model or "gemini-3.5-flash"
+            self._model_pool = [user_model] + [m for m in _GEMINI_FALLBACK_MODELS if m != user_model]
+
         self._current_model_idx = 0
         self._current_model = self._model_pool[0]
 
@@ -85,15 +98,39 @@ class MCPAssistant:
         self._mcp_client: MultiServerMCPClient | None = None
         self._history: list = []
 
-    def _rebuild_agent_with_model(self, model_name: str) -> None:
+    @property
+    def provider(self) -> str:
+        return self._provider
+
+    @property
+    def current_model(self) -> str:
+        return self._current_model
+
+    def _rebuild_agent_with_model(self, model_name: str, provider: str | None = None) -> None:
         """Switch agent LLM to a fallback model while keeping tools & history intact."""
+        if provider:
+            self._provider = provider
         self._current_model = model_name
-        self._llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=self._settings.gemini_api_key,
-            temperature=0.2,
-            max_retries=3,
-        )
+
+        if self._provider == "groq":
+            from langchain_groq import ChatGroq
+            api_key = self._settings.groq_api_key or ""
+            self._llm = ChatGroq(
+                model_name=model_name,
+                groq_api_key=api_key,
+                temperature=0.2,
+                max_retries=2,
+            )
+        else:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            api_key = self._settings.gemini_api_key or ""
+            self._llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=api_key,
+                temperature=0.2,
+                max_retries=3,
+            )
+
         self._agent = create_react_agent(
             model=self._llm,
             tools=self._tools,
@@ -105,27 +142,38 @@ class MCPAssistant:
         mcp_config = build_mcp_config(self._settings)
         self._mcp_client = MultiServerMCPClient(mcp_config)
         self._tools = await self._mcp_client.get_tools()
-        self._rebuild_agent_with_model(self._current_model)
+        self._rebuild_agent_with_model(self._current_model, self._provider)
 
     async def chat(self, message: str) -> str:
         """Run the agent with a user message and return the response text.
 
         Features automated model failover: if one model runs into a rate limit
         or quota exhaustion, OmniPlus immediately shifts to the next available
-        Gemini model and completes the request seamlessly!
+        model and completes the request seamlessly!
         """
         if self._agent is None:
             raise RuntimeError("MCPAssistant.setup() must be called before chat().")
 
+        # Check if provider key is missing
+        if self._provider == "groq" and not self._settings.has_groq():
+            if self._settings.has_gemini():
+                self._provider = "gemini"
+                self._rebuild_agent_with_model(self._settings.gemini_model, "gemini")
+            else:
+                return (
+                    "🔑 **Groq API Key Required**\n\n"
+                    "To use Groq with ultra-fast inference and 14,400 free requests/day:\n"
+                    "1. Get your free API key at [console.groq.com/keys](https://console.groq.com/keys) (takes 10 seconds).\n"
+                    "2. Enter your key in the **Settings** tab on the left, or add `GROQ_API_KEY=gsk_...` in `.env`."
+                )
+
         self._history.append(("human", message))
 
         # Try across the model pool
-        last_error = None
         for attempt in range(len(self._model_pool)):
             active_model = self._model_pool[self._current_model_idx]
             try:
                 result = await self._agent.ainvoke({"messages": self._history})
-                # Succeeded! Process and return response
                 messages = result.get("messages", []) if result else []
                 if messages:
                     last = messages[-1]
@@ -148,7 +196,6 @@ class MCPAssistant:
 
             except Exception as exc:
                 err_text = str(exc)
-                last_error = exc
                 is_quota_or_limit = (
                     "429" in err_text
                     or "RESOURCE_EXHAUSTED" in err_text
@@ -159,21 +206,32 @@ class MCPAssistant:
                 )
 
                 if is_quota_or_limit and attempt < len(self._model_pool) - 1:
-                    # Switch to next model in pool
                     self._current_model_idx = (self._current_model_idx + 1) % len(self._model_pool)
                     next_model = self._model_pool[self._current_model_idx]
                     self._rebuild_agent_with_model(next_model)
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
+                    continue
+                elif is_quota_or_limit and self._provider == "gemini" and self._settings.has_groq():
+                    # Cross-provider failover to Groq!
+                    self._provider = "groq"
+                    self._model_pool = _GROQ_FALLBACK_MODELS
+                    self._current_model_idx = 0
+                    self._rebuild_agent_with_model(self._model_pool[0], "groq")
                     continue
                 elif not is_quota_or_limit:
                     raise exc
 
-        # If all models in the pool failed
-        return (
-            "⏳ **Google AI Studio Free Tier daily quota reached on available models.**\n\n"
-            "Please wait a few minutes before trying again, or generate a fresh free Gemini API key at "
-            "[Google AI Studio](https://aistudio.google.com/app/apikey)."
-        )
+        if self._provider == "gemini":
+            return (
+                "⏳ **Google AI Studio Free Tier daily quota reached (limit: 20 requests/day).**\n\n"
+                "💡 **Recommended Fix:** Switch to **Groq** in Settings! Groq offers 14,400 free requests per day (30 requests/minute).\n"
+                "Get your free Groq API key at [console.groq.com/keys](https://console.groq.com/keys) and enter it in the Settings tab."
+            )
+        else:
+            return (
+                "⏳ **Groq rate limit reached on available models.**\n\n"
+                "Please wait a few seconds and try again. You can also configure another model in the Settings tab."
+            )
 
     def clear_history(self) -> None:
         """Clear the conversation history."""
@@ -196,49 +254,93 @@ class MCPAssistant:
         if self._agent is None:
             raise RuntimeError("MCPAssistant.setup() must be called before stream_chat().")
 
+        if self._provider == "groq" and not self._settings.has_groq():
+            if self._settings.has_gemini():
+                self._provider = "gemini"
+                self._rebuild_agent_with_model(self._settings.gemini_model, "gemini")
+            else:
+                yield {
+                    "type": "error",
+                    "message": (
+                        "🔑 Groq API Key Required. Get a free key at https://console.groq.com/keys "
+                        "and enter it in the Settings tab."
+                    )
+                }
+                return
+
         self._history.append(("human", message))
-        full_text: list[str] = []
 
-        try:
-            async for event in self._agent.astream_events({"messages": self._history}, version="v2"):
-                kind = event["event"]
-                if kind == "on_chat_model_stream":
-                    chunk_content = event["data"]["chunk"].content
-                    if chunk_content:
-                        text = ""
-                        if isinstance(chunk_content, str):
-                            text = chunk_content
-                        elif isinstance(chunk_content, list):
-                            for item in chunk_content:
-                                if isinstance(item, dict) and "text" in item:
-                                    text += item["text"]
-                                elif isinstance(item, str):
-                                    text += item
-                                elif hasattr(item, "text"):
-                                    text += str(item.text)
-                        if text:
-                            full_text.append(text)
-                            yield {"type": "token", "text": text}
-                elif kind == "on_tool_start":
-                    yield {
-                        "type": "tool_start",
-                        "tool": event.get("name", "tool"),
-                        "input": str(event.get("data", {}).get("input", ""))[:140]
-                    }
-                elif kind == "on_tool_end":
-                    yield {
-                        "type": "tool_end",
-                        "tool": event.get("name", "tool"),
-                        "output": str(event.get("data", {}).get("output", ""))[:140]
-                    }
+        # Attempt with automated failover
+        for attempt in range(len(self._model_pool)):
+            full_text: list[str] = []
 
-            final_response = "".join(full_text)
-            if final_response:
-                self._history.append(("assistant", final_response))
-            yield {"type": "done", "response": final_response}
+            try:
+                async for event in self._agent.astream_events({"messages": self._history}, version="v2"):
+                    kind = event["event"]
+                    if kind == "on_chat_model_stream":
+                        chunk_content = event["data"]["chunk"].content
+                        if chunk_content:
+                            text = ""
+                            if isinstance(chunk_content, str):
+                                text = chunk_content
+                            elif isinstance(chunk_content, list):
+                                for item in chunk_content:
+                                    if isinstance(item, dict) and "text" in item:
+                                        text += item["text"]
+                                    elif isinstance(item, str):
+                                        text += item
+                                    elif hasattr(item, "text"):
+                                        text += str(item.text)
+                            if text:
+                                full_text.append(text)
+                                yield {"type": "token", "text": text}
+                    elif kind == "on_tool_start":
+                        yield {
+                            "type": "tool_start",
+                            "tool": event.get("name", "tool"),
+                            "input": str(event.get("data", {}).get("input", ""))[:140]
+                        }
+                    elif kind == "on_tool_end":
+                        yield {
+                            "type": "tool_end",
+                            "tool": event.get("name", "tool"),
+                            "output": str(event.get("data", {}).get("output", ""))[:140]
+                        }
 
-        except Exception as exc:
-            yield {"type": "error", "message": str(exc)}
+                final_response = "".join(full_text)
+                if final_response:
+                    self._history.append(("assistant", final_response))
+                yield {"type": "done", "response": final_response}
+                return
+
+            except Exception as exc:
+                err_text = str(exc)
+                is_quota = (
+                    "429" in err_text
+                    or "RESOURCE_EXHAUSTED" in err_text
+                    or "rate_limit" in err_text.lower()
+                    or "quota" in err_text.lower()
+                    or "404" in err_text
+                )
+
+                if is_quota and len(full_text) == 0:
+                    if attempt < len(self._model_pool) - 1:
+                        self._current_model_idx = (self._current_model_idx + 1) % len(self._model_pool)
+                        next_model = self._model_pool[self._current_model_idx]
+                        self._rebuild_agent_with_model(next_model)
+                        yield {"type": "tool_start", "tool": "failover", "input": f"Switching to {next_model}..."}
+                        await asyncio.sleep(0.5)
+                        continue
+                    elif self._provider == "gemini" and self._settings.has_groq():
+                        self._provider = "groq"
+                        self._model_pool = _GROQ_FALLBACK_MODELS
+                        self._current_model_idx = 0
+                        self._rebuild_agent_with_model(self._model_pool[0], "groq")
+                        yield {"type": "tool_start", "tool": "failover", "input": f"Switching to Groq {self._model_pool[0]}..."}
+                        continue
+
+                yield {"type": "error", "message": err_text}
+                return
 
     def get_tool_names(self) -> list[str]:
         """Return the names of all currently loaded MCP tools.

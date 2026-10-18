@@ -231,14 +231,23 @@ def show_config() -> None:
         print_error(str(e))
         return
     config = build_mcp_config(settings)
-    table = Table(title="MCP Assistant Configuration")
+    table = Table(title="OmniPlus Configuration")
     table.add_column("Setting", style="cyan")
     table.add_column("Value")
-    table.add_row("Model", settings.gemini_model)
+    table.add_row("Active Provider", f"[bold green]{settings.get_active_provider().upper()}[/bold green]")
+    table.add_row("Groq Model", settings.groq_model)
     table.add_row(
-        "API Key",
-        f"{'*' * 8}...{settings.gemini_api_key[-4:]}"
-        if len(settings.gemini_api_key) > 8 else "****"
+        "Groq Key",
+        f"✅ Set ({'*' * 6}...{settings.groq_api_key[-4:]})"
+        if settings.has_groq() and len(settings.groq_api_key or '') > 6
+        else "❌ Not configured"
+    )
+    table.add_row("Gemini Model", settings.gemini_model)
+    table.add_row(
+        "Gemini Key",
+        f"✅ Set ({'*' * 6}...{settings.gemini_api_key[-4:]})"
+        if settings.has_gemini() and len(settings.gemini_api_key) > 6
+        else "❌ Not configured"
     )
     table.add_row("Enabled Servers", ", ".join(config.keys()))
     table.add_row("GitHub", "✅ Enabled" if settings.has_github() else "❌ Not configured")

@@ -4,11 +4,12 @@
 
 ## Features
 
-- 🧠 **Google Gemini AI** — Powered by `gemini-2.0-flash` for fast, intelligent reasoning
+- ⚡ **Groq Cloud LPUs (Recommended)** — Ultra-fast inference with `llama-3.3-70b-versatile` & `llama-3.1-8b-instant`, 14,400 free requests/day with no daily quotas
+- 🧠 **Google Gemini AI** — Powered by `gemini-3.5-flash` with automatic multi-model failover
 - 📁 **Files & Documents** — Read, search, list, and summarize local files and directories via MCP
-- 🌐 **Web Search** — Real-time internet search using DuckDuckGo FastMCP (or Brave Search)
+- 🌐 **Web Search** — Real-time internet search using DuckDuckGo FastMCP
 - 🐙 **Code Repositories** — Query GitHub repos, issues, pull requests, and source code
-- 💬 **Interactive REPL** — Rich terminal TUI with syntax-highlighted markdown, spinners, and slash commands (`/help`, `/tools`, `/clear`, `/exit`)
+- 💬 **Interactive Cosmic Dashboard & REPL** — Localhost Web UI at `http://localhost:8000` with SSE streaming, file tree viewer, search tab, and voice dictation
 - 📜 **Multi-turn Memory** — Context-aware conversation history with automatic session persistence
 - 🔄 **ReAct Agent** — LangGraph ReAct agent pattern for multi-step reasoning and dynamic tool execution
 
@@ -17,9 +18,11 @@
 ```
 OmniPlus/
 ├── src/mcp_assistant/
-│   ├── cli.py              # Click-based CLI entry point (omniplus chat / run / tools / config)
+│   ├── cli.py              # Click-based CLI entry point (omniplus chat / run / tools / config / serve)
 │   ├── config.py           # Settings and environment configuration (.env)
-│   ├── assistant.py        # Core MCPAssistant with LangGraph + MultiServerMCPClient
+│   ├── assistant.py        # Core MCPAssistant with Groq + Gemini + MultiServerMCPClient
+│   ├── web/
+│   │   └── app.py          # FastAPI server with SSE streaming & Cosmic Web UI
 │   ├── servers/            # MCP server configurations
 │   │   ├── filesystem.py   # Local file system MCP server (npx)
 │   │   ├── websearch.py    # Web search MCP server selector
@@ -37,7 +40,7 @@ OmniPlus/
 
 - Python 3.11+
 - Node.js 18+ (required for npx-based MCP servers)
-- A [Google Gemini API key](https://aistudio.google.com/app/apikey)
+- A **[Free Groq API key](https://console.groq.com/keys)** (Recommended, 14,400 req/day) or a **[Google Gemini API key](https://aistudio.google.com/app/apikey)**
 
 ### Steps
 
