@@ -52,113 +52,128 @@ class MCPAssistant:
         settings: Application settings containing API keys and configuration.
     """
 
+_FALLBACK_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemma-4-31b-it",
+]
+
+
+class MCPAssistant:
+    """LangChain ReAct agent backed by Google Gemini and MCP tools.
+
+    Features intelligent automated model failover across Google AI Studio models
+    to seamlessly handle free-tier rate limits and daily quotas.
+
+    Args:
+        settings: Application settings containing API keys and configuration.
+    """
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._llm = ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            google_api_key=settings.gemini_api_key,
-            temperature=0.2,
-            max_retries=6,
-        )
+        # Build priority model list with user's configured model first
+        user_model = settings.gemini_model
+        self._model_pool = [user_model] + [m for m in _FALLBACK_MODELS if m != user_model]
+        self._current_model_idx = 0
+        self._current_model = self._model_pool[0]
+
         self._tools: list[Any] = []
         self._agent: Any = None
         self._mcp_client: MultiServerMCPClient | None = None
-        self._history: list = []  # conversation history
+        self._history: list = []
 
-    async def setup(self) -> None:
-        """Initialise the MCP client, load tools, and create the ReAct agent.
-
-        This must be called before ``chat()`` or ``get_tool_names()``.
-        In langchain-mcp-adapters >= 0.1.0 MultiServerMCPClient is NOT a
-        context manager — just call get_tools() directly.
-        """
-        mcp_config = build_mcp_config(self._settings)
-        self._mcp_client = MultiServerMCPClient(mcp_config)
-        self._tools = await self._mcp_client.get_tools()
-
+    def _rebuild_agent_with_model(self, model_name: str) -> None:
+        """Switch agent LLM to a fallback model while keeping tools & history intact."""
+        self._current_model = model_name
+        self._llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=self._settings.gemini_api_key,
+            temperature=0.2,
+            max_retries=3,
+        )
         self._agent = create_react_agent(
             model=self._llm,
             tools=self._tools,
             prompt=_SYSTEM_PROMPT,
         )
 
+    async def setup(self) -> None:
+        """Initialise the MCP client, load tools, and create the ReAct agent."""
+        mcp_config = build_mcp_config(self._settings)
+        self._mcp_client = MultiServerMCPClient(mcp_config)
+        self._tools = await self._mcp_client.get_tools()
+        self._rebuild_agent_with_model(self._current_model)
+
     async def chat(self, message: str) -> str:
         """Run the agent with a user message and return the response text.
 
-        Automatically handles Google AI Studio Free Tier rate limits (429)
-        with smart retry and backoff.
-
-        Args:
-            message: The user's natural-language query.
-
-        Returns:
-            The assistant's response as a plain string (may contain markdown).
-
-        Raises:
-            RuntimeError: If ``setup()`` has not been called yet.
+        Features automated model failover: if one model runs into a rate limit
+        or quota exhaustion, OmniPlus immediately shifts to the next available
+        Gemini model and completes the request seamlessly!
         """
         if self._agent is None:
             raise RuntimeError("MCPAssistant.setup() must be called before chat().")
 
         self._history.append(("human", message))
 
-        # Retry loop for Google AI Studio free tier rate limits (429 RESOURCE_EXHAUSTED)
-        result = None
-        max_attempts = 4
-        for attempt in range(max_attempts):
+        # Try across the model pool
+        last_error = None
+        for attempt in range(len(self._model_pool)):
+            active_model = self._model_pool[self._current_model_idx]
             try:
                 result = await self._agent.ainvoke({"messages": self._history})
-                break
+                # Succeeded! Process and return response
+                messages = result.get("messages", []) if result else []
+                if messages:
+                    last = messages[-1]
+                    raw = last.content if hasattr(last, "content") else (last.get("content") if isinstance(last, dict) else "")
+                    if isinstance(raw, list):
+                        parts = []
+                        for item in raw:
+                            if isinstance(item, dict) and "text" in item:
+                                parts.append(item["text"])
+                            elif isinstance(item, str):
+                                parts.append(item)
+                            elif hasattr(item, "text"):
+                                parts.append(str(item.text))
+                        content = "\n".join(parts) if parts else str(raw)
+                    else:
+                        content = str(raw) if raw else "(No response)"
+                    self._history.append(("assistant", content))
+                    return content
+                return "(No response)"
+
             except Exception as exc:
                 err_text = str(exc)
-                is_rate_limit = (
+                last_error = exc
+                is_quota_or_limit = (
                     "429" in err_text
                     or "RESOURCE_EXHAUSTED" in err_text
                     or "rate_limit" in err_text.lower()
                     or "quota" in err_text.lower()
+                    or "404" in err_text
+                    or "NOT_FOUND" in err_text
                 )
-                if is_rate_limit and attempt < max_attempts - 1:
-                    # Check if error specifies retry delay e.g. "retry in 5.78s"
-                    delay = 6.0 + (attempt * 2.0)
-                    match = re.search(r"retry in ([\d\.]+)s", err_text, re.IGNORECASE)
-                    if match:
-                        try:
-                            delay = float(match.group(1)) + 0.5
-                        except Exception:
-                            pass
-                    await asyncio.sleep(delay)
-                    continue
-                elif is_rate_limit:
-                    return (
-                        "⏳ **Rate limit reached on Google AI Studio Free Tier (limit: 5 requests/minute).**\n\n"
-                        "Please wait about 10 seconds before asking your next question. "
-                        "*(Note: You can also create an additional free Gemini API key at "
-                        "[Google AI Studio](https://aistudio.google.com/app/apikey) to increase throughput.)*"
-                    )
-                raise
 
-        # The agent returns a dict with a "messages" list; the last message is
-        # the AIMessage containing the final answer.
-        messages = result.get("messages", []) if result else []
-        if messages:
-            last = messages[-1]
-            # Support string content as well as list of content blocks
-            raw = last.content if hasattr(last, "content") else (last.get("content") if isinstance(last, dict) else "")
-            if isinstance(raw, list):
-                parts = []
-                for item in raw:
-                    if isinstance(item, dict) and "text" in item:
-                        parts.append(item["text"])
-                    elif isinstance(item, str):
-                        parts.append(item)
-                    elif hasattr(item, "text"):
-                        parts.append(str(item.text))
-                content = "\n".join(parts) if parts else str(raw)
-            else:
-                content = str(raw) if raw else "(No response)"
-            self._history.append(("assistant", content))
-            return content
-        return "(No response)"
+                if is_quota_or_limit and attempt < len(self._model_pool) - 1:
+                    # Switch to next model in pool
+                    self._current_model_idx = (self._current_model_idx + 1) % len(self._model_pool)
+                    next_model = self._model_pool[self._current_model_idx]
+                    self._rebuild_agent_with_model(next_model)
+                    await asyncio.sleep(1.0)
+                    continue
+                elif not is_quota_or_limit:
+                    raise exc
+
+        # If all models in the pool failed
+        return (
+            "⏳ **Google AI Studio Free Tier daily quota reached on available models.**\n\n"
+            "Please wait a few minutes before trying again, or generate a fresh free Gemini API key at "
+            "[Google AI Studio](https://aistudio.google.com/app/apikey)."
+        )
 
     def clear_history(self) -> None:
         """Clear the conversation history."""
