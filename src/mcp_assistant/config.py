@@ -26,12 +26,18 @@ class Settings:
     gitlab_url: str = "https://gitlab.com"
 
     def has_github(self) -> bool:
-        """Return True if GitHub integration is available."""
-        return bool(self.github_token)
+        """Return True if GitHub integration is available with a valid token."""
+        if not self.github_token:
+            return False
+        token = self.github_token.strip()
+        return bool(token and not token.startswith("your_") and token.lower() != "none")
 
     def has_gitlab(self) -> bool:
-        """Return True if GitLab integration is available."""
-        return bool(self.gitlab_token)
+        """Return True if GitLab integration is available with a valid token."""
+        if not self.gitlab_token:
+            return False
+        token = self.gitlab_token.strip()
+        return bool(token and not token.startswith("your_") and token.lower() != "none")
 
 
 @lru_cache(maxsize=1)
@@ -51,7 +57,7 @@ def get_settings() -> Settings:
 
     return Settings(
         gemini_api_key=gemini_api_key,
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip(),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip(),
         github_token=os.getenv("GITHUB_TOKEN") or None,
         gitlab_token=os.getenv("GITLAB_TOKEN") or None,
         gitlab_url=os.getenv("GITLAB_URL", "https://gitlab.com").strip(),
