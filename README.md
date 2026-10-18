@@ -1,36 +1,35 @@
-# MCP AI Assistant 🤖
+# OmniPlus 🤖✨
 
-An MCP-powered local AI assistant CLI that uses Google Gemini as the AI model, with integrations for local file systems, web search, GitHub, and GitLab.
+**OmniPlus** is an MCP-powered local AI assistant CLI that connects Google Gemini to your real-world tools, local files, live web search, and GitHub repositories using the Model Context Protocol (MCP).
 
 ## Features
 
-- 🧠 **Google Gemini AI** — Powered by `gemini-2.0-flash` for fast, intelligent responses
-- 📁 **File System Integration** — Read, search, list, and summarize local files and directories via MCP
-- 🌐 **Web Search** — Search the web using DuckDuckGo (or Brave Search) through an MCP server
-- 🐙 **GitHub Integration** — Browse repositories, issues, PRs, and code via the GitHub MCP server
-- 🦊 **GitLab Integration** — Access GitLab repositories and resources via MCP
-- 💻 **Rich CLI** — Beautiful terminal UI using the `rich` library with markdown rendering and spinners
-- 🔄 **ReAct Agent** — Uses LangChain's ReAct agent pattern for multi-step reasoning and tool use
+- 🧠 **Google Gemini AI** — Powered by `gemini-2.0-flash` for fast, intelligent reasoning
+- 📁 **Files & Documents** — Read, search, list, and summarize local files and directories via MCP
+- 🌐 **Web Search** — Real-time internet search using DuckDuckGo FastMCP (or Brave Search)
+- 🐙 **Code Repositories** — Query GitHub repos, issues, pull requests, and source code
+- 💬 **Interactive REPL** — Rich terminal TUI with syntax-highlighted markdown, spinners, and slash commands (`/help`, `/tools`, `/clear`, `/exit`)
+- 📜 **Multi-turn Memory** — Context-aware conversation history with automatic session persistence
+- 🔄 **ReAct Agent** — LangGraph ReAct agent pattern for multi-step reasoning and dynamic tool execution
 
 ## Architecture
 
 ```
-mcp-ai-assistant/
+OmniPlus/
 ├── src/mcp_assistant/
-│   ├── cli.py              # Click-based CLI entry point
-│   ├── config.py           # Settings and environment configuration
-│   ├── assistant.py        # Core MCPAssistant with LangChain + MCP
+│   ├── cli.py              # Click-based CLI entry point (omniplus chat / run / tools / config)
+│   ├── config.py           # Settings and environment configuration (.env)
+│   ├── assistant.py        # Core MCPAssistant with LangGraph + MultiServerMCPClient
 │   ├── servers/            # MCP server configurations
-│   │   ├── filesystem.py   # Local file system MCP server
-│   │   ├── websearch.py    # Web search MCP server
-│   │   ├── github.py       # GitHub MCP server
-│   │   └── config_builder.py  # Builds MultiServerMCPClient config
+│   │   ├── filesystem.py   # Local file system MCP server (npx)
+│   │   ├── websearch.py    # Web search MCP server selector
+│   │   ├── _ddg_server.py  # DuckDuckGo FastMCP stdio server
+│   │   ├── github.py       # GitHub MCP server (npx)
+│   │   └── config_builder.py  # MultiServerMCPClient config aggregator
 │   └── ui/
-│       └── display.py      # Rich UI helpers
+│       └── display.py      # Rich TUI helpers
 └── pyproject.toml
 ```
-
-The assistant uses the **Model Context Protocol (MCP)** to connect to external tools and data sources. Each integration is a separate MCP server, and LangChain's `MultiServerMCPClient` manages connections to all of them. The ReAct agent dynamically selects which tools to call based on the user's query.
 
 ## Installation
 
@@ -45,8 +44,8 @@ The assistant uses the **Model Context Protocol (MCP)** to connect to external t
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/your-username/mcp-ai-assistant.git
-   cd mcp-ai-assistant
+   git clone https://github.com/chethangowda-web/OmniPlus.git
+   cd OmniPlus
    ```
 
 2. **Create and activate a virtual environment**

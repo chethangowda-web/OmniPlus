@@ -18,8 +18,8 @@ console = Console()
 def print_welcome_banner() -> None:
     """Print a stylised welcome banner."""
     banner_text = Text()
-    banner_text.append("MCP AI Assistant", style="bold cyan")
-    banner_text.append("  🤖", style="white")
+    banner_text.append("OmniPlus AI Assistant", style="bold cyan")
+    banner_text.append("  🤖✨", style="white")
     banner_text.append("\n\nPowered by ", style="dim white")
     banner_text.append("Google Gemini", style="bold green")
     banner_text.append(" + ", style="dim white")
