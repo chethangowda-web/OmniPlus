@@ -12,6 +12,14 @@ from __future__ import annotations
 import asyncio
 import sys
 
+# Ensure UTF-8 stdout/stderr on Windows to prevent cp1252 UnicodeEncodeError
+for stream in (sys.stdout, sys.stderr):
+    if stream and hasattr(stream, "reconfigure"):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 import click
 from rich.console import Console
 from rich.panel import Panel
@@ -247,7 +255,7 @@ def show_config() -> None:
 def serve(host: str, port: int) -> None:
     """Launch the OmniPlus localhost Web UI in your browser."""
     from mcp_assistant.web.app import run_server
-    console.print(f"\n[bold green]🚀 OmniPlus Web UI starting at:[/bold green] [bold cyan]http://{host}:{port}[/bold cyan]\n")
+    console.print(f"\n[bold green]* OmniPlus Web UI starting at:[/bold green] [bold cyan]http://{host}:{port}[/bold cyan]\n")
     run_server(host=host, port=port)
 
 
