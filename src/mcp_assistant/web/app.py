@@ -1543,7 +1543,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         assistantMsg.querySelector('.msg-bubble').innerHTML = marked.parse(data.response);
       } catch (err) {
-        assistantMsg.querySelector('.msg-bubble').innerHTML = `<p style="color: #f87171;">⚠️ <b>Error:</b> ${err.message}</p>`;
+        let msgText = err.message;
+        if (msgText.includes('429') || msgText.includes('RESOURCE_EXHAUSTED') || msgText.includes('quota')) {
+          msgText = '⏳ <b>Google AI Studio Free Tier rate limit reached.</b><br><br>The free tier allows 5 requests per minute. OmniPlus retried automatically, but the quota window is still active. Please wait <b>10 seconds</b> and try again!';
+          assistantMsg.querySelector('.msg-bubble').innerHTML = `<div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); padding: 0.85rem; border-radius: 10px; color: #fde68a; font-size: 0.88rem; line-height: 1.5;">${msgText}</div>`;
+        } else {
+          assistantMsg.querySelector('.msg-bubble').innerHTML = `<p style="color: #f87171;">⚠️ <b>Error:</b> ${msgText}</p>`;
+        }
       } finally {
         sendBtn.disabled = false;
         sendBtn.innerHTML = `<span>Send</span> <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;

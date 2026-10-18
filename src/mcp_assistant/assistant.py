@@ -8,7 +8,9 @@ This module provides the ``MCPAssistant`` class, which:
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,7 @@ class MCPAssistant:
             model=settings.gemini_model,
             google_api_key=settings.gemini_api_key,
             temperature=0.2,
+            max_retries=6,
         )
         self._tools: list[Any] = []
         self._agent: Any = None
@@ -82,6 +85,9 @@ class MCPAssistant:
     async def chat(self, message: str) -> str:
         """Run the agent with a user message and return the response text.
 
+        Automatically handles Google AI Studio Free Tier rate limits (429)
+        with smart retry and backoff.
+
         Args:
             message: The user's natural-language query.
 
@@ -95,11 +101,45 @@ class MCPAssistant:
             raise RuntimeError("MCPAssistant.setup() must be called before chat().")
 
         self._history.append(("human", message))
-        result = await self._agent.ainvoke({"messages": self._history})
+
+        # Retry loop for Google AI Studio free tier rate limits (429 RESOURCE_EXHAUSTED)
+        result = None
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                result = await self._agent.ainvoke({"messages": self._history})
+                break
+            except Exception as exc:
+                err_text = str(exc)
+                is_rate_limit = (
+                    "429" in err_text
+                    or "RESOURCE_EXHAUSTED" in err_text
+                    or "rate_limit" in err_text.lower()
+                    or "quota" in err_text.lower()
+                )
+                if is_rate_limit and attempt < max_attempts - 1:
+                    # Check if error specifies retry delay e.g. "retry in 5.78s"
+                    delay = 6.0 + (attempt * 2.0)
+                    match = re.search(r"retry in ([\d\.]+)s", err_text, re.IGNORECASE)
+                    if match:
+                        try:
+                            delay = float(match.group(1)) + 0.5
+                        except Exception:
+                            pass
+                    await asyncio.sleep(delay)
+                    continue
+                elif is_rate_limit:
+                    return (
+                        "⏳ **Rate limit reached on Google AI Studio Free Tier (limit: 5 requests/minute).**\n\n"
+                        "Please wait about 10 seconds before asking your next question. "
+                        "*(Note: You can also create an additional free Gemini API key at "
+                        "[Google AI Studio](https://aistudio.google.com/app/apikey) to increase throughput.)*"
+                    )
+                raise
 
         # The agent returns a dict with a "messages" list; the last message is
         # the AIMessage containing the final answer.
-        messages = result.get("messages", [])
+        messages = result.get("messages", []) if result else []
         if messages:
             last = messages[-1]
             # Support string content as well as list of content blocks
