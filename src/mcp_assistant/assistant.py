@@ -102,13 +102,20 @@ class MCPAssistant:
         messages = result.get("messages", [])
         if messages:
             last = messages[-1]
-            # Support both AIMessage objects and plain dicts.
-            if hasattr(last, "content"):
-                content = str(last.content)
-            elif isinstance(last, dict):
-                content = str(last.get("content", ""))
+            # Support string content as well as list of content blocks
+            raw = last.content if hasattr(last, "content") else (last.get("content") if isinstance(last, dict) else "")
+            if isinstance(raw, list):
+                parts = []
+                for item in raw:
+                    if isinstance(item, dict) and "text" in item:
+                        parts.append(item["text"])
+                    elif isinstance(item, str):
+                        parts.append(item)
+                    elif hasattr(item, "text"):
+                        parts.append(str(item.text))
+                content = "\n".join(parts) if parts else str(raw)
             else:
-                content = "(No response)"
+                content = str(raw) if raw else "(No response)"
             self._history.append(("assistant", content))
             return content
         return "(No response)"

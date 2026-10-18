@@ -20,7 +20,7 @@ class Settings:
     """Application settings loaded from environment variables."""
 
     gemini_api_key: str
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-3.8-flash"
     github_token: str | None = None
     gitlab_token: str | None = None
     gitlab_url: str = "https://gitlab.com"
